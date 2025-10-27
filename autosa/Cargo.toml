@@ -1,0 +1,18 @@
+[package]
+name = "autosa"
+version = "0.1.0"
+edition = "2021"
+authors = ["AutoSA Team"]
+description = "Automatic Scheduler Adjustment - Automatically optimize Linux kernel schedulers based on workload"
+license = "GPL-2.0"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
+clap = { version = "4.0", features = ["derive"] }
+procfs = "0.15"
+serde_json = "1.0"
+
+[dev-dependencies]
+tokio-test = "0.4"
