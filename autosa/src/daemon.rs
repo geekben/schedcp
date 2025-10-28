@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use tokio::time::interval;
 
 use crate::metrics::MetricsCollector;
+use crate::mcp_client::{McpClient, RunSchedulerRequest, StopSchedulerRequest};
 use crate::policy::{PolicyEngine, SchedulerRecommendation, WorkloadType};
 
 /// Configuration for the automatic scheduler adjustment daemon
@@ -21,6 +22,8 @@ pub struct DaemonConfig {
     pub min_switch_interval_secs: u64,
     /// Enable automatic scheduler switching
     pub enable_auto_switch: bool,
+    /// Path to the schedcp-cli binary
+    pub schedcp_cli_path: String,
 }
 
 impl Default for DaemonConfig {
@@ -31,6 +34,7 @@ impl Default for DaemonConfig {
             min_confidence_threshold: 0.7,
             min_switch_interval_secs: 300, // 5 minutes
             enable_auto_switch: true,
+            schedcp_cli_path: "/usr/local/bin/schedcp-cli".to_string(),
         }
     }
 }
@@ -52,12 +56,14 @@ pub struct AutoSchedulerDaemon {
     policy_engine: PolicyEngine,
     metrics_collector: MetricsCollector,
     state: Arc<Mutex<DaemonState>>,
-    // We would integrate with the MCP server here for actual scheduler management
-    // For now, we'll simulate the interface
+    mcp_client: McpClient,
+    current_execution_id: Arc<Mutex<Option<String>>>,
 }
 
 impl AutoSchedulerDaemon {
     pub fn new(config: DaemonConfig) -> Self {
+        let mcp_client = McpClient::new(config.schedcp_cli_path.clone());
+
         Self {
             config,
             policy_engine: PolicyEngine::new(),
@@ -70,6 +76,8 @@ impl AutoSchedulerDaemon {
                 last_recommendation: None,
                 metrics_samples_collected: 0,
             })),
+            mcp_client,
+            current_execution_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -225,7 +233,7 @@ impl AutoSchedulerDaemon {
         Ok(true)
     }
 
-    /// Switch to a new scheduler (simulated)
+    /// Switch to a new scheduler using the MCP client
     async fn switch_scheduler(&self, recommendation: &SchedulerRecommendation) -> Result<()> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -237,20 +245,57 @@ impl AutoSchedulerDaemon {
             recommendation.suggested_args
         );
 
-        // In a real implementation, we would:
-        // 1. Stop the current scheduler using the MCP server
-        // 2. Start the new scheduler using the MCP server
-        // 3. Update our state
-
-        // For now, just update our state
+        // Stop the current scheduler if there is one running
         {
-            let mut state = self.state.lock().await;
-            state.current_scheduler = Some(recommendation.scheduler_name.clone());
-            state.last_switch_timestamp = Some(now);
+            let execution_id = self.current_execution_id.lock().await;
+            if let Some(id) = &*execution_id {
+                println!("Stopping current scheduler with execution ID: {}", id);
+                let stop_request = StopSchedulerRequest {
+                    execution_id: id.clone(),
+                };
+
+                match self.mcp_client.stop_scheduler(stop_request) {
+                    Ok(response) => {
+                        println!("Successfully stopped scheduler: {}", response.message);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to stop current scheduler: {}", e);
+                        // Continue anyway, as we might still want to start the new scheduler
+                    }
+                }
+            }
         }
 
-        // Log the switch
-        println!("Scheduler switched to {} at {}", recommendation.scheduler_name, now);
+        // Start the new scheduler
+        let run_request = RunSchedulerRequest {
+            name: recommendation.scheduler_name.clone(),
+            args: recommendation.suggested_args.clone(),
+        };
+
+        match self.mcp_client.run_scheduler(run_request) {
+            Ok(response) => {
+                println!("Successfully started scheduler: {}", response.message);
+
+                // Update our state
+                {
+                    let mut state = self.state.lock().await;
+                    state.current_scheduler = Some(recommendation.scheduler_name.clone());
+                    state.last_switch_timestamp = Some(now);
+                }
+
+                // Store the new execution ID
+                {
+                    let mut execution_id = self.current_execution_id.lock().await;
+                    *execution_id = Some(response.execution_id.clone());
+                }
+
+                println!("Scheduler switched to {} at {}", recommendation.scheduler_name, now);
+            }
+            Err(e) => {
+                eprintln!("Failed to start new scheduler: {}", e);
+                return Err(e);
+            }
+        }
 
         Ok(())
     }

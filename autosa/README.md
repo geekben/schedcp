@@ -29,9 +29,9 @@ Based on these metrics, it classifies the current workload type and recommends t
 - **Continuous Monitoring**: Collects system metrics every second
 - **Workload Classification**: Automatically identifies workload types (CPU-bound, I/O-bound, latency-sensitive, etc.)
 - **Intelligent Scheduler Selection**: Recommends optimal schedulers based on workload characteristics
-- **Automatic Switching**: Can automatically switch schedulers when workload patterns change
+- **Automatic Switching**: Can automatically switch schedulers when workload patterns change using the schedcp MCP server
 - **Configurable Policies**: Adjustable parameters for switching behavior
-- **Integration Ready**: Designed to integrate with the schedcp MCP server
+- **Real-time Integration**: Direct integration with schedcp MCP server for scheduler management
 
 ## Supported Schedulers
 
@@ -63,6 +63,9 @@ autosa start
 
 # Start with custom configuration
 autosa start --collection-interval 2 --aggregation-window 120 --min-confidence 0.8
+
+# Start with custom schedcp-cli path
+autosa start --schedcp-cli-path /usr/local/bin/schedcp-cli
 ```
 
 ### Stop the daemon
@@ -92,6 +95,7 @@ AutoSA can be configured with the following parameters:
 - `min_confidence_threshold`: Minimum confidence level required to switch schedulers (default: 0.7)
 - `min_switch_interval_secs`: Minimum time between scheduler switches (default: 300 seconds)
 - `enable_auto_switch`: Enable automatic scheduler switching (default: true)
+- `schedcp_cli_path`: Path to the schedcp-cli binary (default: /root/schedcp/mcp/target/release/schedcp-cli)
 
 ## Architecture
 
@@ -104,13 +108,14 @@ AutoSA consists of several key components:
 
 ## Integration
 
-AutoSA is designed to integrate with the schedcp MCP server for actual scheduler management. The current implementation includes a simulation layer that can be replaced with real MCP calls.
+AutoSA integrates with the schedcp MCP server for actual scheduler management. It uses the schedcp-cli tool to start, stop, and manage Linux kernel schedulers from the sched-ext framework. This enables real-time scheduler switching based on workload analysis.
 
 ## Requirements
 
 - Linux kernel 6.12+ with sched-ext support
 - Rust 1.82+ for building
-- Root privileges for scheduler management (in integrated version)
+- Root privileges for scheduler management
+- schedcp MCP server with schedcp-cli tool for scheduler switching
 
 ## Deployment
 
@@ -183,6 +188,9 @@ timeout 10s autosa start --collection-interval 1 --aggregation-window 5
 # Check system resources usage
 ps aux | grep autosa
 top -p $(pgrep autosa)
+
+# Verify scheduler switching (requires schedcp MCP server)
+# The daemon will automatically switch schedulers based on workload analysis
 ```
 
 ## Why Rust?

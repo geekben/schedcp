@@ -38,6 +38,10 @@ enum Commands {
         /// Disable automatic scheduler switching
         #[arg(long)]
         no_auto_switch: bool,
+
+        /// Path to the schedcp-cli binary
+        #[arg(long, default_value = "/root/schedcp/mcp/target/release/schedcp-cli")]
+        schedcp_cli_path: String,
     },
 
     /// Stop the daemon
@@ -62,9 +66,10 @@ async fn main() -> Result<()> {
             min_confidence,
             min_switch_interval,
             no_auto_switch,
+            schedcp_cli_path,
         } => {
             // Load configuration
-            let config = if let Some(config_path) = config {
+            let config = if let Some(_config_path) = config {
                 // In a real implementation, we would load from file
                 // For now, we'll use the provided command line arguments
                 DaemonConfig {
@@ -73,6 +78,7 @@ async fn main() -> Result<()> {
                     min_confidence_threshold: *min_confidence,
                     min_switch_interval_secs: *min_switch_interval,
                     enable_auto_switch: !*no_auto_switch,
+                    schedcp_cli_path: schedcp_cli_path.clone(),
                 }
             } else {
                 DaemonConfig {
@@ -81,6 +87,7 @@ async fn main() -> Result<()> {
                     min_confidence_threshold: *min_confidence,
                     min_switch_interval_secs: *min_switch_interval,
                     enable_auto_switch: !*no_auto_switch,
+                    schedcp_cli_path: schedcp_cli_path.clone(),
                 }
             };
 

@@ -6,10 +6,12 @@
 pub mod metrics;
 pub mod policy;
 pub mod daemon;
+pub mod mcp_client;
 
 // Re-export the main types for convenience
 pub use daemon::{AutoSchedulerDaemon, DaemonConfig, DaemonState};
 pub use metrics::{AggregatedMetrics, MetricsCollector, SystemMetrics};
+pub use mcp_client::McpClient;
 pub use policy::{PolicyEngine, SchedulerRecommendation, WorkloadType};
 
 use anyhow::Result;
