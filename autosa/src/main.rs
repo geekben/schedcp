@@ -24,7 +24,7 @@ enum Commands {
         collection_interval: u64,
 
         /// Aggregation window in seconds
-        #[arg(long, default_value = "60")]
+        #[arg(long, default_value = "3")]
         aggregation_window: u64,
 
         /// Minimum confidence threshold (0.0-1.0)
@@ -32,7 +32,7 @@ enum Commands {
         min_confidence: f64,
 
         /// Minimum switch interval in seconds
-        #[arg(long, default_value = "300")]
+        #[arg(long, default_value = "3")]
         min_switch_interval: u64,
 
         /// Disable automatic scheduler switching

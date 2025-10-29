@@ -30,9 +30,9 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             collection_interval_secs: 1,
-            aggregation_window_secs: 60,
+            aggregation_window_secs: 3,
             min_confidence_threshold: 0.7,
-            min_switch_interval_secs: 300, // 5 minutes
+            min_switch_interval_secs: 3,
             enable_auto_switch: true,
             schedcp_cli_path: "/usr/local/bin/schedcp-cli".to_string(),
         }
