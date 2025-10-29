@@ -9,6 +9,15 @@ use crate::metrics::MetricsCollector;
 use crate::mcp_client::{McpClient, RunSchedulerRequest, StopSchedulerRequest};
 use crate::policy::{PolicyEngine, SchedulerRecommendation, WorkloadType};
 
+/// Helper function to get formatted timestamp
+fn get_timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("[{}]", now)
+}
+
 /// Configuration for the automatic scheduler adjustment daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
@@ -86,7 +95,8 @@ impl AutoSchedulerDaemon {
         {
             let mut state = self.state.lock().await;
             state.is_running = true;
-            println!("Automatic scheduler adjustment daemon started");
+            let timestamp = get_timestamp();
+            println!("{} Automatic scheduler adjustment daemon started", timestamp);
         }
 
         // Start the monitoring loop
@@ -99,7 +109,8 @@ impl AutoSchedulerDaemon {
     pub async fn stop(&self) -> Result<()> {
         let mut state = self.state.lock().await;
         state.is_running = false;
-        println!("Automatic scheduler adjustment daemon stopped");
+        let timestamp = get_timestamp();
+        println!("{} Automatic scheduler adjustment daemon stopped", timestamp);
         Ok(())
     }
 
@@ -152,27 +163,43 @@ impl AutoSchedulerDaemon {
             // Classify workload
             let workload_type = self.policy_engine.classify_workload(&metrics);
 
-            // Update state with current workload type
-            {
-                let mut state = self.state.lock().await;
-                state.current_workload_type = Some(workload_type.clone());
-            }
-
             // Get scheduler recommendation
             let recommendation = self.policy_engine.recommend_scheduler(&metrics);
 
-            // Update state with recommendation
-            {
+            // Check if there's a significant change to report
+            let should_report = {
                 let mut state = self.state.lock().await;
-                state.last_recommendation = Some(recommendation.clone());
-            }
 
-            println!("Workload classified as: {:?}", workload_type);
-            println!("Recommended scheduler: {} (confidence: {:.2}%) - {}",
-                recommendation.scheduler_name,
-                recommendation.confidence * 100.0,
-                recommendation.reason
-            );
+                // Check if workload type changed
+                let workload_changed = state.current_workload_type.as_ref() != Some(&workload_type);
+
+                // Check if recommendation changed significantly (different scheduler or confidence change > 10%)
+                let recommendation_changed = match &state.last_recommendation {
+                    Some(last_rec) => {
+                        last_rec.scheduler_name != recommendation.scheduler_name ||
+                        (last_rec.confidence - recommendation.confidence).abs() > 0.1
+                    },
+                    None => true,
+                };
+
+                // Update state
+                state.current_workload_type = Some(workload_type.clone());
+                state.last_recommendation = Some(recommendation.clone());
+
+                workload_changed || recommendation_changed
+            };
+
+            // Only print significant changes
+            if should_report {
+                let timestamp = get_timestamp();
+                println!("{} Workload classified as: {:?}", timestamp, workload_type);
+                println!("{} Recommended scheduler: {} (confidence: {:.2}%) - {}",
+                    timestamp,
+                    recommendation.scheduler_name,
+                    recommendation.confidence * 100.0,
+                    recommendation.reason
+                );
+            }
 
             // Check if we should switch schedulers
             if self.should_switch_scheduler(&recommendation).await? {
@@ -225,7 +252,8 @@ impl AutoSchedulerDaemon {
 
         if let Some(last_switch) = last_switch_time {
             if now - last_switch < self.config.min_switch_interval_secs {
-                println!("Not switching scheduler - minimum interval not reached");
+                let timestamp = get_timestamp();
+                println!("{} Not switching scheduler - minimum interval not reached", timestamp);
                 return Ok(false);
             }
         }
@@ -239,8 +267,10 @@ impl AutoSchedulerDaemon {
             .duration_since(UNIX_EPOCH)
             .context("Failed to get current time")?
             .as_secs();
+        let timestamp = get_timestamp();
 
-        println!("Switching to scheduler: {} with args: {:?}",
+        println!("{} Switching to scheduler: {} with args: {:?}",
+            timestamp,
             recommendation.scheduler_name,
             recommendation.suggested_args
         );
@@ -249,17 +279,17 @@ impl AutoSchedulerDaemon {
         {
             let execution_id = self.current_execution_id.lock().await;
             if let Some(id) = &*execution_id {
-                println!("Stopping current scheduler with execution ID: {}", id);
+                println!("{} Stopping current scheduler with execution ID: {}", timestamp, id);
                 let stop_request = StopSchedulerRequest {
                     execution_id: id.clone(),
                 };
 
                 match self.mcp_client.stop_scheduler(stop_request) {
                     Ok(response) => {
-                        println!("Successfully stopped scheduler: {}", response.message);
+                        println!("{} Successfully stopped scheduler: {}", timestamp, response.message);
                     }
                     Err(e) => {
-                        eprintln!("Failed to stop current scheduler: {}", e);
+                        eprintln!("{} Failed to stop current scheduler: {}", timestamp, e);
                         // Continue anyway, as we might still want to start the new scheduler
                     }
                 }
@@ -274,7 +304,7 @@ impl AutoSchedulerDaemon {
 
         match self.mcp_client.run_scheduler(run_request) {
             Ok(response) => {
-                println!("Successfully started scheduler: {}", response.message);
+                println!("{} Successfully started scheduler: {}", timestamp, response.message);
 
                 // Update our state
                 {
@@ -289,10 +319,10 @@ impl AutoSchedulerDaemon {
                     *execution_id = Some(response.execution_id.clone());
                 }
 
-                println!("Scheduler switched to {} at {}", recommendation.scheduler_name, now);
+                println!("{} Scheduler switched to {} at {}", timestamp, recommendation.scheduler_name, now);
             }
             Err(e) => {
-                eprintln!("Failed to start new scheduler: {}", e);
+                eprintln!("{} Failed to start new scheduler: {}", timestamp, e);
                 return Err(e);
             }
         }
