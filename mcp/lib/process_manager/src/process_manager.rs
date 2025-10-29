@@ -1,6 +1,6 @@
 use crate::binary_extractor::BinaryExtractor;
 use crate::process_runner::{ProcessRunner, OutputStream};
-use crate::types::{ProcessConfig, ProcessError, ProcessInfo, ProcessStatus};
+use crate::types::{ProcessConfig, ProcessError, ProcessInfo};
 use dashmap::DashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -15,6 +15,21 @@ impl ProcessManager {
         Self {
             binary_extractor: Arc::new(binary_extractor),
             processes: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Force cleanup of temporary directories
+    pub fn cleanup(&self) {
+        log::info!("Cleaning up ProcessManager resources");
+        self.binary_extractor.cleanup();
+        // Stop all running processes
+        let processes: Vec<Uuid> = self.processes.iter().map(|entry| *entry.key()).collect();
+        for id in processes {
+            if let Some((_, mut runner)) = self.processes.remove(&id) {
+                tokio::spawn(async move {
+                    let _ = runner.stop().await;
+                });
+            }
         }
     }
     

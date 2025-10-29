@@ -85,7 +85,7 @@ impl SchedulerManager {
         let home_dir = std::env::var("HOME")
             .map_err(|_| anyhow!("HOME environment variable not set"))?;
         let scx_bin_dir = Path::new(&home_dir).join(".schedcp").join("scxbin");
-        
+
         // Check if directory exists
         if !scx_bin_dir.exists() {
             return Err(anyhow!(
@@ -93,38 +93,38 @@ impl SchedulerManager {
                 scx_bin_dir.display()
             ));
         }
-        
+
         // Load binaries from external directory
         let entries = std::fs::read_dir(&scx_bin_dir)
             .map_err(|e| anyhow!("Failed to read directory {}: {}", scx_bin_dir.display(), e))?;
-        
+
         let mut binary_count = 0;
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
             let file_name = entry.file_name().to_string_lossy().to_string();
-            
+
             // Only include files that start with "scx_" and are not hash-suffixed versions
             if file_name.starts_with("scx_") && !file_name.contains('-') && path.is_file() {
                 // Read the binary data
                 let binary_data = std::fs::read(&path)
                     .map_err(|e| anyhow!("Failed to read {}: {}", path.display(), e))?;
-                
+
                 extractor.add_binary(&file_name, &binary_data)
                     .map_err(|e| anyhow!("Failed to add {}: {}", file_name, e))?;
-                
+
                 log::info!("Loaded scheduler binary: {} from {}", file_name, path.display());
                 binary_count += 1;
             }
         }
-        
+
         if binary_count == 0 {
             return Err(anyhow!(
                 "No scheduler binaries found in {}. Please run 'make install' in the scheduler directory.",
                 scx_bin_dir.display()
             ));
         }
-        
+
         log::info!("Loaded {} scheduler binaries from {}", binary_count, scx_bin_dir.display());
 
         let process_manager = Arc::new(ProcessManager::new(extractor));
@@ -140,6 +140,12 @@ impl SchedulerManager {
             sudo_password: None,
             generator: Arc::new(generator),
         })
+    }
+
+    /// Force cleanup of temporary directories and running processes
+    pub fn cleanup(&self) {
+        log::info!("Cleaning up SchedulerManager resources");
+        self.process_manager.cleanup();
     }
 
     #[allow(dead_code)]
@@ -289,7 +295,7 @@ impl SchedulerManager {
 
         tokio::spawn(async move {
             // Capture stdout
-            if let Some(mut stdout) = child.stdout.take() {
+            if let Some(stdout) = child.stdout.take() {
                 use tokio::io::AsyncBufReadExt;
                 let mut reader = tokio::io::BufReader::new(stdout);
                 let mut line = String::new();

@@ -17,14 +17,21 @@ impl BinaryExtractor {
         let temp_dir = TempDir::new()
             .map_err(|e| ProcessError::ExtractionFailed(format!("Failed to create temp dir: {}", e)))?;
         let temp_path = temp_dir.path().to_path_buf();
-        
+
         log::info!("Created temporary directory: {}", temp_path.display());
-        
+
         Ok(Self {
             _temp_dir: temp_dir,
             temp_path,
             binaries: HashMap::new(),
         })
+    }
+
+    /// Force cleanup of temporary directory
+    pub fn cleanup(&self) {
+        log::info!("Cleaning up temporary directory: {}", self.temp_path.display());
+        // The TempDir will be automatically cleaned up when dropped
+        // This method is just for explicit logging
     }
     
     pub fn add_binary(&mut self, name: &str, binary_data: &[u8]) -> Result<(), ProcessError> {

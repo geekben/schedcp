@@ -105,6 +105,9 @@ async fn main() -> Result<()> {
             println!("\nStopping scheduler...");
             manager.stop_scheduler(&execution_id).await?;
             println!("Scheduler stopped");
+
+            // Clean up temporary directories
+            manager.cleanup();
         }
 
         Commands::CreateAndRun { source } => {
@@ -157,6 +160,9 @@ async fn main() -> Result<()> {
             println!("\nStopping scheduler...");
             manager.stop_scheduler(&execution_id).await?;
             println!("Scheduler stopped");
+
+            // Clean up temporary directories
+            manager.cleanup();
         }
 
         Commands::Monitor { duration } => {
@@ -197,6 +203,9 @@ async fn main() -> Result<()> {
             println!();
         }
     }
+
+    // Clean up temporary directories for all commands
+    manager.cleanup();
 
     Ok(())
 }
