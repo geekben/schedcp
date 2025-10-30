@@ -10,6 +10,8 @@ pub struct BinaryExtractor {
     _temp_dir: TempDir,
     temp_path: PathBuf,
     binaries: HashMap<String, PathBuf>,
+    // Track the actual temp directory path for manual cleanup
+    temp_dir_path: PathBuf,
 }
 
 impl BinaryExtractor {
@@ -17,6 +19,7 @@ impl BinaryExtractor {
         let temp_dir = TempDir::new()
             .map_err(|e| ProcessError::ExtractionFailed(format!("Failed to create temp dir: {}", e)))?;
         let temp_path = temp_dir.path().to_path_buf();
+        let temp_dir_path = temp_path.clone();
 
         log::info!("Created temporary directory: {}", temp_path.display());
 
@@ -24,14 +27,26 @@ impl BinaryExtractor {
             _temp_dir: temp_dir,
             temp_path,
             binaries: HashMap::new(),
+            temp_dir_path,
         })
     }
 
     /// Force cleanup of temporary directory
     pub fn cleanup(&self) {
         log::info!("Cleaning up temporary directory: {}", self.temp_path.display());
-        // The TempDir will be automatically cleaned up when dropped
-        // This method is just for explicit logging
+        // Force remove the directory and its contents
+        if self.temp_dir_path.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&self.temp_dir_path) {
+                log::warn!("Failed to remove temp directory {}: {}", self.temp_dir_path.display(), e);
+            } else {
+                log::info!("Successfully removed temp directory: {}", self.temp_dir_path.display());
+            }
+        }
+    }
+    
+    /// Get the temporary directory path for external tracking
+    pub fn get_temp_dir_path(&self) -> &Path {
+        &self.temp_dir_path
     }
     
     pub fn add_binary(&mut self, name: &str, binary_data: &[u8]) -> Result<(), ProcessError> {

@@ -147,6 +147,11 @@ impl SchedulerManager {
         log::info!("Cleaning up SchedulerManager resources");
         self.process_manager.cleanup();
     }
+    
+    /// Get the temporary directory path for external tracking
+    pub fn get_temp_dir_path(&self) -> Option<&std::path::Path> {
+        Some(self.process_manager.get_temp_dir_path())
+    }
 
     #[allow(dead_code)]
     pub fn set_sudo_password(&mut self, password: String) {

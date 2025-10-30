@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::process::Command;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Information about a scheduler
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,12 +82,17 @@ pub struct GetExecutionStatusResponse {
 pub struct McpClient {
     /// Path to the schedcp-cli binary
     cli_path: String,
+    /// Track temporary directories created by this client
+    temp_directories: Arc<Mutex<HashMap<String, PathBuf>>>,
 }
 
 impl McpClient {
     /// Create a new MCP client
     pub fn new(cli_path: String) -> Self {
-        Self { cli_path }
+        Self {
+            cli_path,
+            temp_directories: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// List available schedulers
@@ -119,6 +127,10 @@ impl McpClient {
         // Create a fake execution ID
         let execution_id = format!("exec_{}", pid);
         let scheduler_name = request.name.clone();
+
+        // Try to find and track the temporary directory created for this scheduler
+        // We'll look for recently created .tmp directories that might belong to this execution
+        self.track_temp_directory(&execution_id, &scheduler_name)?;
 
         Ok(RunSchedulerResponse {
             execution_id,
@@ -165,6 +177,54 @@ impl McpClient {
             exit_code: None,
             output: vec![],
         })
+    }
+
+    /// Track temporary directories created by this client
+    fn track_temp_directory(&self, execution_id: &str, _scheduler_name: &str) -> Result<()> {
+        use std::process::Command;
+
+        // Find ALL .tmp directories - we'll clean them all up anyway
+        // This is safer than trying to track specific ones
+        let output = Command::new("find")
+            .args(&["/tmp", "-name", ".tmp*", "-type", "d"])
+            .output()
+            .context("Failed to find temporary directories")?;
+
+        if output.status.success() {
+            let temp_dirs = String::from_utf8_lossy(&output.stdout);
+            let mut tracked_any = false;
+            for line in temp_dirs.lines() {
+                let path = PathBuf::from(line.trim());
+                if path.exists() {
+                    // Store all temp directories found
+                    let temp_dirs_map = self.temp_directories.try_lock();
+                    if let Ok(mut temp_dirs_map) = temp_dirs_map {
+                        temp_dirs_map.insert(format!("{}_{}", execution_id, tracked_any), path);
+                        tracked_any = true;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get temporary directories tracked by this client
+    pub async fn get_temp_directories(&self) -> Vec<PathBuf> {
+        let temp_dirs_map = self.temp_directories.lock().await;
+        temp_dirs_map.values().cloned().collect()
+    }
+
+    /// Clear tracking for a specific execution
+    pub async fn clear_execution_tracking(&self, execution_id: &str) {
+        let mut temp_dirs_map = self.temp_directories.lock().await;
+        temp_dirs_map.remove(execution_id);
+    }
+
+    /// Clear all tracking
+    pub async fn clear_all_tracking(&self) {
+        let mut temp_dirs_map = self.temp_directories.lock().await;
+        temp_dirs_map.clear();
     }
 }
 

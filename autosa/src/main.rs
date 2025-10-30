@@ -2,6 +2,8 @@ use anyhow::Result;
 use autosa::{AutoSchedulerDaemon, DaemonConfig};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::fs;
+use std::process;
 
 #[derive(Parser)]
 #[command(name = "autosa")]
@@ -32,7 +34,7 @@ enum Commands {
         min_confidence: f64,
 
         /// Minimum switch interval in seconds
-        #[arg(long, default_value = "3")]
+        #[arg(long, default_value = "9")]
         min_switch_interval: u64,
 
         /// Disable automatic scheduler switching
@@ -45,7 +47,11 @@ enum Commands {
     },
 
     /// Stop the daemon
-    Stop,
+    Stop {
+        /// Force stop even if daemon doesn't respond
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Get current daemon status
     Status,
@@ -99,14 +105,103 @@ async fn main() -> Result<()> {
             println!("  Minimum switch interval: {} seconds", config.min_switch_interval_secs);
             println!("  Auto-switching: {}", if config.enable_auto_switch { "enabled" } else { "disabled" });
 
+            // Check if daemon is already running
+            let pid_file = "/tmp/autosa.pid";
+            if fs::metadata(pid_file).is_ok() {
+                let pid_content = fs::read_to_string(&pid_file)?;
+                if let Ok(pid) = pid_content.trim().parse::<u32>() {
+                    // Check if the process is still running
+                    let status = process::Command::new("kill")
+                        .arg("-0")
+                        .arg(pid.to_string())
+                        .status();
+
+                    if let Ok(status) = status {
+                        if status.success() {
+                            eprintln!("Error: autosa daemon is already running with PID {}", pid);
+                            eprintln!("Use 'autosa stop' to stop the existing daemon first");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                // PID file exists but process is not running, remove stale file
+                let _ = fs::remove_file(&pid_file);
+            }
+
             let mut daemon = AutoSchedulerDaemon::new(config);
+
+            // Write PID file for stop command to use
+            fs::write(pid_file, process::id().to_string())?;
+
+            // Start the daemon
             daemon.start().await?;
         }
 
-        Commands::Stop => {
+        Commands::Stop { force } => {
             println!("Stopping daemon...");
-            // In a real implementation, we would communicate with the running daemon to stop it
-            println!("Daemon stopped");
+
+            // Try to gracefully stop the daemon
+            let pid_file = "/tmp/autosa.pid";
+            if fs::metadata(pid_file).is_ok() {
+                let pid_content = fs::read_to_string(pid_file)?;
+                if let Ok(pid) = pid_content.trim().parse::<u32>() {
+                    // Send SIGTERM to the daemon
+                    if !force {
+                        process::Command::new("kill")
+                            .arg("-TERM")
+                            .arg(pid.to_string())
+                            .output()?;
+
+                        // Wait a moment for graceful shutdown
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+
+                    // Check if process is still running
+                    let status = process::Command::new("kill")
+                        .arg("-0")
+                        .arg(pid.to_string())
+                        .status()?;
+
+                    if status.success() && *force {
+                        // Force kill if still running and force flag is set
+                        process::Command::new("kill")
+                            .arg("-KILL")
+                            .arg(pid.to_string())
+                            .output()?;
+                    }
+
+                    // Remove PID file
+                    let _ = fs::remove_file(pid_file);
+
+                    // Clean up any remaining .tmp directories
+                    println!("Cleaning up any remaining temporary directories...");
+                    let output = process::Command::new("find")
+                        .args(&["/tmp", "-name", ".tmp*", "-type", "d"])
+                        .output()?;
+
+                    if output.status.success() {
+                        let temp_dirs = String::from_utf8_lossy(&output.stdout);
+                        for line in temp_dirs.lines() {
+                            let path = line.trim();
+                            if !path.is_empty() {
+                                let _ = process::Command::new("rm")
+                                    .arg("-rf")
+                                    .arg(path)
+                                    .output();
+                                println!("Cleaned up temporary directory: {}", path);
+                            }
+                        }
+                    }
+
+                    println!("Daemon stopped");
+                } else {
+                    eprintln!("Invalid PID in pid file");
+                    // Remove stale PID file
+                    let _ = fs::remove_file(pid_file);
+                }
+            } else {
+                println!("Daemon is not running (no PID file found)");
+            }
         }
 
         Commands::Status => {

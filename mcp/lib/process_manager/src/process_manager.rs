@@ -33,6 +33,11 @@ impl ProcessManager {
         }
     }
     
+    /// Get the temporary directory path for external tracking
+    pub fn get_temp_dir_path(&self) -> &std::path::Path {
+        self.binary_extractor.get_temp_dir_path()
+    }
+    
     pub async fn start_process(&self, config: ProcessConfig) -> Result<Uuid, ProcessError> {
         // Get binary path
         let binary_path = self.binary_extractor

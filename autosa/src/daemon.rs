@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::time::interval;
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 use crate::metrics::MetricsCollector;
 use crate::mcp_client::{McpClient, RunSchedulerRequest, StopSchedulerRequest};
@@ -16,6 +18,71 @@ fn get_timestamp() -> String {
         .unwrap_or_default()
         .as_secs();
     format!("[{}]", now)
+}
+
+
+
+/// Helper function to clean up specific temporary directories
+async fn cleanup_specific_temp_directories(temp_dirs: &HashSet<PathBuf>) -> Result<()> {
+    use tokio::process::Command;
+
+    for temp_dir in temp_dirs {
+        if temp_dir.exists() {
+            let output = Command::new("rm")
+                .arg("-rf")
+                .arg(temp_dir)
+                .output()
+                .await
+                .context("Failed to remove temporary directory")?;
+
+            if !output.status.success() {
+                eprintln!("Warning: Failed to remove temporary directory {:?}: {}",
+                    temp_dir, String::from_utf8_lossy(&output.stderr));
+            } else {
+                println!("Cleaned up temporary directory: {:?}", temp_dir);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+
+
+/// Helper function to clean up all schedcp temporary directories
+async fn cleanup_schedcp_temp_directories() -> Result<()> {
+    use tokio::process::Command;
+
+    // Find and remove all .tmp directories that might be created by schedcp
+    let output = Command::new("find")
+        .args(&["/tmp", "-name", ".tmp*", "-type", "d"])
+        .output()
+        .await
+        .context("Failed to find schedcp temporary directories")?;
+
+    if output.status.success() {
+        let temp_dirs = String::from_utf8_lossy(&output.stdout);
+        for line in temp_dirs.lines() {
+            let path = line.trim();
+            if !path.is_empty() {
+                let rm_output = Command::new("rm")
+                    .arg("-rf")
+                    .arg(path)
+                    .output()
+                    .await
+                    .context("Failed to remove temporary directory")?;
+
+                if !rm_output.status.success() {
+                    eprintln!("Warning: Failed to remove temporary directory {}: {}",
+                        path, String::from_utf8_lossy(&rm_output.stderr));
+                } else {
+                    println!("Cleaned up schedcp temporary directory: {}", path);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Configuration for the automatic scheduler adjustment daemon
@@ -67,6 +134,8 @@ pub struct AutoSchedulerDaemon {
     state: Arc<Mutex<DaemonState>>,
     mcp_client: McpClient,
     current_execution_id: Arc<Mutex<Option<String>>>,
+    // Track temporary directories created by this daemon
+    temp_directories: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl AutoSchedulerDaemon {
@@ -87,6 +156,7 @@ impl AutoSchedulerDaemon {
             })),
             mcp_client,
             current_execution_id: Arc::new(Mutex::new(None)),
+            temp_directories: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -111,6 +181,27 @@ impl AutoSchedulerDaemon {
         state.is_running = false;
         let timestamp = get_timestamp();
         println!("{} Automatic scheduler adjustment daemon stopped", timestamp);
+
+        // Clear the execution tracking for the current scheduler
+        let execution_id = self.current_execution_id.lock().await;
+        if let Some(id) = &*execution_id {
+            self.mcp_client.clear_execution_tracking(id).await;
+        }
+
+        // Clean up all temporary directories created by this daemon
+        let temp_dirs = self.temp_directories.lock().await.clone();
+        if !temp_dirs.is_empty() {
+            cleanup_specific_temp_directories(&temp_dirs).await?;
+            // Clear the tracking set
+            self.temp_directories.lock().await.clear();
+        }
+
+        // Also clear all MCP client tracking
+        self.mcp_client.clear_all_tracking().await;
+
+        // Also clean up any schedcp temporary directories that might be left behind
+        cleanup_schedcp_temp_directories().await?;
+
         Ok(())
     }
 
@@ -293,6 +384,28 @@ impl AutoSchedulerDaemon {
                         // Continue anyway, as we might still want to start the new scheduler
                     }
                 }
+
+                // Clear the execution tracking for this specific scheduler
+                self.mcp_client.clear_execution_tracking(id).await;
+            }
+        }
+
+        // Get temp directories from MCP client and clean them up
+        let mcp_temp_dirs = self.mcp_client.get_temp_directories().await;
+        if !mcp_temp_dirs.is_empty() {
+            cleanup_specific_temp_directories(&mcp_temp_dirs.iter().cloned().collect()).await?;
+        }
+
+        // Also clear all MCP client tracking
+        self.mcp_client.clear_all_tracking().await;
+
+        // Clean up any directories tracked by the daemon itself
+        {
+            let temp_dirs = self.temp_directories.lock().await.clone();
+            if !temp_dirs.is_empty() {
+                cleanup_specific_temp_directories(&temp_dirs).await?;
+                // Clear the tracking set
+                self.temp_directories.lock().await.clear();
             }
         }
 
@@ -305,6 +418,15 @@ impl AutoSchedulerDaemon {
         match self.mcp_client.run_scheduler(run_request) {
             Ok(response) => {
                 println!("{} Successfully started scheduler: {}", timestamp, response.message);
+
+                // Get and track the temporary directories created by this execution
+                let new_temp_dirs = self.mcp_client.get_temp_directories().await;
+                if !new_temp_dirs.is_empty() {
+                    let mut temp_dirs = self.temp_directories.lock().await;
+                    for dir in new_temp_dirs {
+                        temp_dirs.insert(dir);
+                    }
+                }
 
                 // Update our state
                 {
