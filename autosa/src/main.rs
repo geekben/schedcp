@@ -44,6 +44,14 @@ enum Commands {
         /// Path to the schedcp-cli binary
         #[arg(long, default_value = "/root/schedcp/mcp/target/release/schedcp-cli")]
         schedcp_cli_path: String,
+
+        /// Path to the switching events log file
+        #[arg(long, default_value = "/var/log/autosa/switching_events.log")]
+        log_file_path: String,
+
+        /// Log level for tracing (trace, debug, info, warn, error)
+        #[arg(long, default_value = "warn")]
+        log_level: String,
     },
 
     /// Stop the daemon
@@ -73,6 +81,8 @@ async fn main() -> Result<()> {
             min_switch_interval,
             no_auto_switch,
             schedcp_cli_path,
+            log_file_path,
+            log_level,
         } => {
             // Load configuration
             let config = if let Some(_config_path) = config {
@@ -85,6 +95,8 @@ async fn main() -> Result<()> {
                     min_switch_interval_secs: *min_switch_interval,
                     enable_auto_switch: !*no_auto_switch,
                     schedcp_cli_path: schedcp_cli_path.clone(),
+                    log_file_path: log_file_path.clone(),
+                    log_level: log_level.clone(),
                 }
             } else {
                 DaemonConfig {
@@ -94,6 +106,8 @@ async fn main() -> Result<()> {
                     min_switch_interval_secs: *min_switch_interval,
                     enable_auto_switch: !*no_auto_switch,
                     schedcp_cli_path: schedcp_cli_path.clone(),
+                    log_file_path: log_file_path.clone(),
+                    log_level: log_level.clone(),
                 }
             };
 
@@ -104,6 +118,8 @@ async fn main() -> Result<()> {
             println!("  Minimum confidence threshold: {:.2}", config.min_confidence_threshold);
             println!("  Minimum switch interval: {} seconds", config.min_switch_interval_secs);
             println!("  Auto-switching: {}", if config.enable_auto_switch { "enabled" } else { "disabled" });
+            println!("  Log file path: {}", config.log_file_path);
+            println!("  Log level: {}", config.log_level);
 
             // Check if daemon is already running
             let pid_file = "/tmp/autosa.pid";
@@ -128,7 +144,7 @@ async fn main() -> Result<()> {
                 let _ = fs::remove_file(&pid_file);
             }
 
-            let mut daemon = AutoSchedulerDaemon::new(config);
+            let mut daemon = AutoSchedulerDaemon::new(config)?;
 
             // Write PID file for stop command to use
             fs::write(pid_file, process::id().to_string())?;

@@ -4,8 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::time::interval;
+use tracing::{info, error, warn, trace};
 
-use crate::metrics::MetricsCollector;
+use crate::logging::{SwitchLogger, create_switch_event, create_failed_switch_event, calculate_decision_factors};
+use crate::metrics::{MetricsCollector, AggregatedMetrics};
 use crate::mcp_client::{McpClient, RunSchedulerRequest, StopSchedulerRequest};
 use crate::policy::{PolicyEngine, SchedulerRecommendation, WorkloadType};
 
@@ -69,6 +71,10 @@ pub struct DaemonConfig {
     pub enable_auto_switch: bool,
     /// Path to the schedcp-cli binary
     pub schedcp_cli_path: String,
+    /// Path to the switching events log file
+    pub log_file_path: String,
+    /// Log level for tracing (trace, debug, info, warn, error)
+    pub log_level: String,
 }
 
 impl Default for DaemonConfig {
@@ -80,6 +86,8 @@ impl Default for DaemonConfig {
             min_switch_interval_secs: 3,
             enable_auto_switch: true,
             schedcp_cli_path: "/usr/local/bin/schedcp-cli".to_string(),
+            log_file_path: "/var/log/autosa/switching_events.log".to_string(),
+            log_level: "warn".to_string(),
         }
     }
 }
@@ -103,13 +111,18 @@ pub struct AutoSchedulerDaemon {
     state: Arc<Mutex<DaemonState>>,
     mcp_client: McpClient,
     current_execution_id: Arc<Mutex<Option<String>>>,
+    switch_logger: SwitchLogger,
 }
 
 impl AutoSchedulerDaemon {
-    pub fn new(config: DaemonConfig) -> Self {
+    pub fn new(config: DaemonConfig) -> Result<Self> {
         let mcp_client = McpClient::new(config.schedcp_cli_path.clone());
+        let switch_logger = SwitchLogger::new(config.log_file_path.clone());
 
-        Self {
+        // Initialize logging system
+        switch_logger.init_logging(&config.log_level)?;
+
+        Ok(Self {
             config,
             policy_engine: PolicyEngine::new(),
             metrics_collector: MetricsCollector::new(3600), // Keep 1 hour of samples at 1/sec
@@ -123,7 +136,8 @@ impl AutoSchedulerDaemon {
             })),
             mcp_client,
             current_execution_id: Arc::new(Mutex::new(None)),
-        }
+            switch_logger,
+        })
     }
 
     /// Start the daemon
@@ -242,8 +256,8 @@ impl AutoSchedulerDaemon {
             }
 
             // Check if we should switch schedulers
-            if self.should_switch_scheduler(&recommendation).await? {
-                self.switch_scheduler(&recommendation).await?;
+            if self.should_switch_scheduler(&recommendation, &metrics, &workload_type).await? {
+                self.switch_scheduler(&recommendation, &metrics, &workload_type).await?;
             }
         }
 
@@ -251,14 +265,55 @@ impl AutoSchedulerDaemon {
     }
 
     /// Determine if we should switch to a new scheduler
-    async fn should_switch_scheduler(&self, recommendation: &SchedulerRecommendation) -> Result<bool> {
+    async fn should_switch_scheduler(&self, recommendation: &SchedulerRecommendation, metrics: &AggregatedMetrics, workload_type: &WorkloadType) -> Result<bool> {
         // Check if auto-switching is enabled
         if !self.config.enable_auto_switch {
+            let reason = "Auto-switching is disabled";
+            trace!("Not switching scheduler: {}", reason);
+
+            let current_scheduler = {
+                let state = self.state.lock().await;
+                state.current_scheduler.clone()
+            };
+
+            // Only log no-switch decisions at trace level to avoid log spam
+            if tracing::level_enabled!(tracing::Level::TRACE) {
+                if let Some(ref scheduler) = current_scheduler {
+                    self.switch_logger.log_no_switch_decision(
+                        Some(scheduler),
+                        recommendation,
+                        metrics,
+                        workload_type,
+                        reason,
+                    )?;
+                }
+            }
             return Ok(false);
         }
 
         // Check confidence threshold
         if recommendation.confidence < self.config.min_confidence_threshold {
+            let reason = format!("Confidence {:.2} below threshold {:.2}",
+                recommendation.confidence, self.config.min_confidence_threshold);
+            trace!("Not switching scheduler: {}", reason);
+
+            let current_scheduler = {
+                let state = self.state.lock().await;
+                state.current_scheduler.clone()
+            };
+
+            // Only log no-switch decisions at trace level to avoid log spam
+            if tracing::level_enabled!(tracing::Level::TRACE) {
+                if let Some(ref scheduler) = current_scheduler {
+                    self.switch_logger.log_no_switch_decision(
+                        Some(scheduler),
+                        recommendation,
+                        metrics,
+                        workload_type,
+                        &reason,
+                    )?;
+                }
+            }
             return Ok(false);
         }
 
@@ -271,11 +326,30 @@ impl AutoSchedulerDaemon {
         // If no current scheduler, we should switch
         let current_scheduler = match current_scheduler {
             Some(scheduler) => scheduler,
-            None => return Ok(true),
+            None => {
+                info!("No current scheduler, will switch to {}", recommendation.scheduler_name);
+                return Ok(true);
+            }
         };
 
         // Don't switch if it's the same scheduler
         if current_scheduler == recommendation.scheduler_name {
+            let reason = "Same scheduler already running";
+            trace!("Not switching scheduler: {}", reason);
+
+            // Only log no-switch decisions at trace level to avoid log spam
+            if tracing::level_enabled!(tracing::Level::TRACE) {
+                // Only log no-switch decisions at trace level to avoid log spam
+            if tracing::level_enabled!(tracing::Level::TRACE) {
+                self.switch_logger.log_no_switch_decision(
+                    Some(&current_scheduler),
+                    recommendation,
+                    metrics,
+                    workload_type,
+                    &reason,
+                )?;
+            }
+            }
             return Ok(false);
         }
 
@@ -292,8 +366,17 @@ impl AutoSchedulerDaemon {
 
         if let Some(last_switch) = last_switch_time {
             if now - last_switch < self.config.min_switch_interval_secs {
-                let timestamp = get_timestamp();
-                println!("{} Not switching scheduler - minimum interval not reached", timestamp);
+                let reason = format!("Minimum switch interval not reached ({} < {} seconds)",
+                    now - last_switch, self.config.min_switch_interval_secs);
+                trace!("Not switching scheduler: {}", reason);
+
+                self.switch_logger.log_no_switch_decision(
+                    Some(&current_scheduler),
+                    recommendation,
+                    metrics,
+                    workload_type,
+                    &reason,
+                )?;
                 return Ok(false);
             }
         }
@@ -302,34 +385,48 @@ impl AutoSchedulerDaemon {
     }
 
     /// Switch to a new scheduler using the MCP client
-    async fn switch_scheduler(&self, recommendation: &SchedulerRecommendation) -> Result<()> {
-        let now = SystemTime::now()
+    async fn switch_scheduler(&self, recommendation: &SchedulerRecommendation, metrics: &AggregatedMetrics, workload_type: &WorkloadType) -> Result<()> {
+        let start_time = SystemTime::now();
+        let now = start_time
             .duration_since(UNIX_EPOCH)
             .context("Failed to get current time")?
             .as_secs();
-        let timestamp = get_timestamp();
 
-        println!("{} Switching to scheduler: {} with args: {:?}",
-            timestamp,
+        info!("Switching to scheduler: {} with args: {:?}",
             recommendation.scheduler_name,
             recommendation.suggested_args
+        );
+
+        // Get current scheduler for logging
+        let previous_scheduler = {
+            let state = self.state.lock().await;
+            state.current_scheduler.clone()
+        };
+
+        // Calculate decision factors
+        let decision_factors = calculate_decision_factors(
+            previous_scheduler.as_deref(),
+            recommendation,
+            self.config.enable_auto_switch,
+            self.config.min_confidence_threshold,
+            true, // We're here because min interval was met
         );
 
         // Stop the current scheduler if there is one running
         {
             let execution_id = self.current_execution_id.lock().await;
             if let Some(id) = &*execution_id {
-                println!("{} Stopping current scheduler with execution ID: {}", timestamp, id);
+                info!("Stopping current scheduler with execution ID: {}", id);
                 let stop_request = StopSchedulerRequest {
                     execution_id: id.clone(),
                 };
 
                 match self.mcp_client.stop_scheduler(stop_request) {
                     Ok(response) => {
-                        println!("{} Successfully stopped scheduler: {}", timestamp, response.message);
+                        info!("Successfully stopped scheduler: {}", response.message);
                     }
                     Err(e) => {
-                        eprintln!("{} Failed to stop current scheduler: {}", timestamp, e);
+                        warn!("Failed to stop current scheduler: {}", e);
                         // Continue anyway, as we might still want to start the new scheduler
                     }
                 }
@@ -347,7 +444,11 @@ impl AutoSchedulerDaemon {
 
         match self.mcp_client.run_scheduler(run_request) {
             Ok(response) => {
-                println!("{} Successfully started scheduler: {}", timestamp, response.message);
+                let switch_duration = start_time.elapsed()
+                    .context("Failed to calculate switch duration")?
+                    .as_millis() as u64;
+
+                info!("Successfully started scheduler: {}", response.message);
 
                 // Update our state
                 {
@@ -362,10 +463,40 @@ impl AutoSchedulerDaemon {
                     *execution_id = Some(response.execution_id.clone());
                 }
 
-                println!("{} Scheduler switched to {} at {}", timestamp, recommendation.scheduler_name, now);
+                info!("Scheduler switched to {} at {}", recommendation.scheduler_name, now);
+
+                // Log the successful switch
+                let switch_event = create_switch_event(
+                    previous_scheduler,
+                    recommendation,
+                    metrics,
+                    workload_type,
+                    decision_factors,
+                    Some(response.execution_id),
+                    Some(switch_duration),
+                );
+
+                if let Err(e) = self.switch_logger.log_switch_event(&switch_event) {
+                    error!("Failed to log switching event: {}", e);
+                }
             }
             Err(e) => {
-                eprintln!("{} Failed to start new scheduler: {}", timestamp, e);
+                error!("Failed to start new scheduler: {}", e);
+
+                // Log the failed switch
+                let switch_event = create_failed_switch_event(
+                    previous_scheduler,
+                    recommendation,
+                    metrics,
+                    workload_type,
+                    decision_factors,
+                    e.to_string(),
+                );
+
+                if let Err(log_err) = self.switch_logger.log_switch_event(&switch_event) {
+                    error!("Failed to log failed switching event: {}", log_err);
+                }
+
                 return Err(e);
             }
         }
