@@ -5,6 +5,9 @@ results_*.json
 bcc
 schedcp.log.*
 /schedcp_workloads.json
+Cargo.lock
+target/
+workloads/
 
 # Custom scheduler executables
 scheduler/custom_schedulers/scx_cxl
