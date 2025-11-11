@@ -149,8 +149,11 @@ async fn main() -> Result<()> {
             // Write PID file for stop command to use
             fs::write(pid_file, process::id().to_string())?;
 
-            // Start the daemon
+            // Start the daemon directly
             daemon.start().await?;
+
+            // Clean up PID file on normal exit
+            let _ = fs::remove_file(pid_file);
         }
 
         Commands::Stop { force } => {

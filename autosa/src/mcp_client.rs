@@ -76,6 +76,7 @@ pub struct GetExecutionStatusResponse {
 }
 
 /// MCP Client for communicating with schedcp server via CLI
+#[derive(Clone)]
 pub struct McpClient {
     /// Path to the schedcp-cli binary
     cli_path: String,

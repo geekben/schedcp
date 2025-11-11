@@ -39,6 +39,7 @@ pub struct DecisionFactors {
 }
 
 /// Logger for switching events
+#[derive(Clone)]
 pub struct SwitchLogger {
     log_file_path: String,
 }

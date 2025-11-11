@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::time::interval;
+use tokio::signal;
 use tracing::{info, error, warn, trace};
 
 use crate::logging::{SwitchLogger, create_switch_event, create_failed_switch_event, calculate_decision_factors};
@@ -149,6 +150,70 @@ impl AutoSchedulerDaemon {
             println!("{} Automatic scheduler adjustment daemon started", timestamp);
         }
 
+        // Set up signal handling for graceful shutdown
+        let state_clone = self.state.clone();
+        let _switch_logger_clone = self.switch_logger.clone();
+        let current_execution_id_clone = self.current_execution_id.clone();
+        let mcp_client_clone = self.mcp_client.clone();
+
+        tokio::spawn(async move {
+            match signal::ctrl_c().await {
+                Ok(()) => {
+                    let timestamp = get_timestamp();
+                    println!("\n{} Received Ctrl+C, shutting down gracefully...", timestamp);
+
+                    // Stop the daemon
+                    {
+                        let mut state = state_clone.lock().await;
+                        state.is_running = false;
+                    }
+
+                    // Stop current scheduler and restore default
+                    {
+                        let execution_id = current_execution_id_clone.lock().await;
+                        if let Some(id) = &*execution_id {
+                            use crate::mcp_client::StopSchedulerRequest;
+                            let stop_request = StopSchedulerRequest {
+                                execution_id: id.clone(),
+                            };
+
+                            if let Err(e) = mcp_client_clone.stop_scheduler(stop_request) {
+                                eprintln!("{} Failed to stop scheduler: {}", timestamp, e);
+                            } else {
+                                println!("{} Scheduler stopped, disabling sched_ext", timestamp);
+                            }
+                        }
+                    }
+
+                    // Disable sched_ext to restore system default scheduler
+                    println!("{} Disabling sched_ext to restore system default scheduler", timestamp);
+                    if let Ok(output) = tokio::process::Command::new("sh")
+                        .arg("-c")
+                        .arg("echo 'bye' > /sys/kernel/sched_ext/state 2>/dev/null || echo 'Failed to disable sched_ext'")
+                        .output()
+                        .await
+                    {
+                        if output.status.success() {
+                            println!("{} Successfully disabled sched_ext", timestamp);
+                        } else {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            eprintln!("{} Failed to disable sched_ext: {}", timestamp, stderr);
+                        }
+                    }
+
+                    // Clean up temporary directories
+                    if let Err(e) = cleanup_schedcp_temp_directories().await {
+                        eprintln!("{} Failed to cleanup temporary directories: {}", timestamp, e);
+                    }
+
+                    std::process::exit(0);
+                }
+                Err(err) => {
+                    eprintln!("Unable to listen for shutdown signal: {}", err);
+                }
+            }
+        });
+
         // Start the monitoring loop
         self.monitoring_loop().await?;
 
@@ -161,6 +226,10 @@ impl AutoSchedulerDaemon {
         state.is_running = false;
         let timestamp = get_timestamp();
         println!("{} Automatic scheduler adjustment daemon stopped", timestamp);
+
+        // Stop the current scheduler and restore default
+        drop(state); // Release the lock before calling stop_current_scheduler
+        self.stop_current_scheduler().await?;
 
         // Clean up any schedcp temporary directories that might be left behind
         cleanup_schedcp_temp_directories().await?;
@@ -507,6 +576,66 @@ impl AutoSchedulerDaemon {
     /// Get current daemon state
     pub async fn get_state(&self) -> DaemonState {
         self.state.lock().await.clone()
+    }
+
+    /// Stop the current scheduler and restore system default
+    async fn stop_current_scheduler(&self) -> Result<()> {
+        let timestamp = get_timestamp();
+
+        // Stop the current scheduler if there is one running
+        {
+            let execution_id = self.current_execution_id.lock().await;
+            if let Some(id) = &*execution_id {
+                println!("{} Stopping current scheduler with execution ID: {}", timestamp, id);
+                let stop_request = StopSchedulerRequest {
+                    execution_id: id.clone(),
+                };
+
+                match self.mcp_client.stop_scheduler(stop_request) {
+                    Ok(response) => {
+                        println!("{} Successfully stopped scheduler: {}", timestamp, response.message);
+                    }
+                    Err(e) => {
+                        eprintln!("{} Failed to stop current scheduler: {}", timestamp, e);
+                    }
+                }
+            }
+        }
+
+        // Disable sched_ext to restore system default scheduler
+        println!("{} Disabling sched_ext to restore system default scheduler", timestamp);
+        match tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("echo 'bye' > /sys/kernel/sched_ext/state 2>/dev/null || echo 'Failed to disable sched_ext'")
+            .output()
+            .await
+        {
+            Ok(output) => {
+                if output.status.success() {
+                    println!("{} Successfully disabled sched_ext", timestamp);
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    eprintln!("{} Failed to disable sched_ext: {}", timestamp, stderr);
+                }
+            }
+            Err(e) => {
+                eprintln!("{} Error disabling sched_ext: {}", timestamp, e);
+            }
+        }
+
+        // Clear the execution ID
+        {
+            let mut execution_id = self.current_execution_id.lock().await;
+            *execution_id = None;
+        }
+
+        // Update state
+        {
+            let mut state = self.state.lock().await;
+            state.current_scheduler = None;
+        }
+
+        Ok(())
     }
 
     /// Get configuration
