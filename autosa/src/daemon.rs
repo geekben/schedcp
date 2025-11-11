@@ -6,11 +6,12 @@ use tokio::sync::Mutex;
 use tokio::time::interval;
 use tokio::signal;
 use tracing::{info, error, warn, trace};
+use num_cpus;
 
 use crate::logging::{SwitchLogger, create_switch_event, create_failed_switch_event, calculate_decision_factors};
 use crate::metrics::{MetricsCollector, AggregatedMetrics};
 use crate::mcp_client::{McpClient, RunSchedulerRequest, StopSchedulerRequest};
-use crate::policy::{PolicyEngine, SchedulerRecommendation, WorkloadType};
+use crate::policy::{PolicyEngine, SchedulerRecommendation, WorkloadType, PerformanceFeedback};
 
 /// Helper function to get formatted timestamp
 fn get_timestamp() -> String {
@@ -76,19 +77,130 @@ pub struct DaemonConfig {
     pub log_file_path: String,
     /// Log level for tracing (trace, debug, info, warn, error)
     pub log_level: String,
+    /// System profile for adaptive tuning
+    pub system_profile: SystemProfile,
+    /// Enable performance feedback loop
+    pub enable_performance_feedback: bool,
+    /// Stabilization period after switch (in seconds)
+    pub stabilization_period_secs: u64,
+    /// Minimum performance improvement threshold (0.0-1.0)
+    pub min_performance_improvement: f64,
+}
+
+/// System profile for different types of systems
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemProfile {
+    /// Profile type (desktop, server, laptop, etc.)
+    pub profile_type: ProfileType,
+    /// Number of CPU cores
+    pub cpu_cores: usize,
+    /// Total memory in GB
+    pub total_memory_gb: f64,
+    /// Storage type (ssd, hdd, nvme)
+    pub storage_type: StorageType,
+    /// Primary use case
+    pub primary_use_case: UseCase,
+}
+
+/// System profile types
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum ProfileType {
+    Desktop,
+    Server,
+    Laptop,
+    Embedded,
+    VirtualMachine,
+}
+
+/// Storage types
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum StorageType {
+    SSD,
+    HDD,
+    NVMe,
+    Hybrid,
+}
+
+/// Primary use cases
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum UseCase {
+    General,
+    Gaming,
+    Development,
+    Database,
+    WebServer,
+    HighPerformanceComputing,
+}
+
+impl Default for SystemProfile {
+    fn default() -> Self {
+        Self {
+            profile_type: ProfileType::Desktop,
+            cpu_cores: num_cpus::get(),
+            total_memory_gb: Self::detect_memory_gb(),
+            storage_type: StorageType::SSD,
+            primary_use_case: UseCase::General,
+        }
+    }
+}
+
+impl SystemProfile {
+    fn detect_memory_gb() -> f64 {
+        use procfs::Meminfo;
+        if let Ok(meminfo) = Meminfo::new() {
+            meminfo.mem_total as f64 / (1024.0 * 1024.0 * 1024.0) // Convert to GB
+        } else {
+            8.0 // Default fallback
+        }
+    }
+
+    /// Get adaptive confidence threshold based on system profile
+    pub fn get_adaptive_confidence_threshold(&self) -> f64 {
+        match (self.profile_type, self.primary_use_case) {
+            (ProfileType::Desktop, UseCase::Gaming) => 0.6, // More aggressive for gaming
+            (ProfileType::Server, _) => 0.8,               // More conservative for servers
+            (ProfileType::Laptop, _) => 0.7,               // Balanced for laptops
+            _ => 0.7,                                      // Default
+        }
+    }
+
+    /// Get adaptive switch interval based on system profile
+    pub fn get_adaptive_switch_interval(&self) -> u64 {
+        match (self.profile_type, self.primary_use_case) {
+            (ProfileType::Desktop, UseCase::Gaming) => 5,   // Faster switching for gaming
+            (ProfileType::Server, _) => 30,                 // Slower for server stability
+            (ProfileType::Laptop, _) => 10,                 // Balanced for laptops
+            _ => 10,                                        // Default
+        }
+    }
+
+    /// Get adaptive aggregation window based on system profile
+    pub fn get_adaptive_aggregation_window(&self) -> u64 {
+        match self.profile_type {
+            ProfileType::Desktop => 3,
+            ProfileType::Server => 10,  // Longer window for stability
+            ProfileType::Laptop => 5,
+            _ => 5,
+        }
+    }
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
+        let system_profile = SystemProfile::default();
         Self {
             collection_interval_secs: 1,
-            aggregation_window_secs: 3,
-            min_confidence_threshold: 0.7,
-            min_switch_interval_secs: 3,
+            aggregation_window_secs: system_profile.get_adaptive_aggregation_window(),
+            min_confidence_threshold: system_profile.get_adaptive_confidence_threshold(),
+            min_switch_interval_secs: system_profile.get_adaptive_switch_interval(),
             enable_auto_switch: true,
             schedcp_cli_path: "/usr/local/bin/schedcp-cli".to_string(),
             log_file_path: "/var/log/autosa/switching_events.log".to_string(),
             log_level: "warn".to_string(),
+            system_profile,
+            enable_performance_feedback: true,
+            stabilization_period_secs: 30,
+            min_performance_improvement: 0.1,
         }
     }
 }
@@ -113,6 +225,7 @@ pub struct AutoSchedulerDaemon {
     mcp_client: McpClient,
     current_execution_id: Arc<Mutex<Option<String>>>,
     switch_logger: SwitchLogger,
+    performance_feedback: PerformanceFeedback,
 }
 
 impl AutoSchedulerDaemon {
@@ -138,6 +251,7 @@ impl AutoSchedulerDaemon {
             mcp_client,
             current_execution_id: Arc::new(Mutex::new(None)),
             switch_logger,
+            performance_feedback: PerformanceFeedback::new(),
         })
     }
 
@@ -276,14 +390,53 @@ impl AutoSchedulerDaemon {
     }
 
     /// Analyze collected metrics and adjust scheduler if needed
-    async fn analyze_and_adjust(&self) -> Result<()> {
+    async fn analyze_and_adjust(&mut self) -> Result<()> {
         // Calculate aggregated metrics over our window
         let aggregated = self.metrics_collector.calculate_aggregated_metrics(
             self.config.aggregation_window_secs
         );
 
         if let Some(metrics) = aggregated {
-            // Classify workload
+            // Update performance feedback
+            self.performance_feedback.update_metrics(&metrics);
+
+            // Check if we need to rollback due to poor performance
+            let current_scheduler = {
+                let state = self.state.lock().await;
+                state.current_scheduler.clone()
+            };
+
+            let current_workload = {
+                let state = self.state.lock().await;
+                state.current_workload_type.clone()
+            };
+
+            if let (Some(ref scheduler), Some(ref workload)) = (current_scheduler, current_workload) {
+                if self.performance_feedback.should_rollback(scheduler, workload) {
+                    let timestamp = get_timestamp();
+                    println!("{} Performance degradation detected, considering rollback", timestamp);
+
+                    // Try to get the best scheduler for this workload
+                    if let Some(best_scheduler) = self.performance_feedback.get_best_scheduler(workload) {
+                        if best_scheduler != *scheduler {
+                            println!("{} Rolling back to better performing scheduler: {}", timestamp, best_scheduler);
+                            // Create a rollback recommendation
+                            let rollback_rec = SchedulerRecommendation {
+                                scheduler_name: best_scheduler.clone(),
+                                confidence: 0.9, // High confidence for rollback
+                                reason: "Rollback due to performance degradation".to_string(),
+                                suggested_args: self.policy_engine.get_scheduler_info(&best_scheduler)
+                                    .map(|info| info.default_args.clone())
+                                    .unwrap_or_default(),
+                            };
+                            self.switch_scheduler(&rollback_rec, &metrics, workload).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            // Classify workload (need mutable reference)
             let workload_type = self.policy_engine.classify_workload(&metrics);
 
             // Get scheduler recommendation
@@ -360,10 +513,13 @@ impl AutoSchedulerDaemon {
             return Ok(false);
         }
 
+        // Use adaptive confidence threshold based on system profile
+        let adaptive_threshold = self.config.system_profile.get_adaptive_confidence_threshold();
+
         // Check confidence threshold
-        if recommendation.confidence < self.config.min_confidence_threshold {
-            let reason = format!("Confidence {:.2} below threshold {:.2}",
-                recommendation.confidence, self.config.min_confidence_threshold);
+        if recommendation.confidence < adaptive_threshold {
+            let reason = format!("Confidence {:.2} below adaptive threshold {:.2}",
+                recommendation.confidence, adaptive_threshold);
             trace!("Not switching scheduler: {}", reason);
 
             let current_scheduler = {
@@ -380,6 +536,30 @@ impl AutoSchedulerDaemon {
                         metrics,
                         workload_type,
                         &reason,
+                    )?;
+                }
+            }
+            return Ok(false);
+        }
+
+        // Check if workload is stable enough for a switch
+        if !self.policy_engine.is_workload_stable() {
+            let reason = "Workload not stable enough for switching";
+            trace!("Not switching scheduler: {}", reason);
+
+            let current_scheduler = {
+                let state = self.state.lock().await;
+                state.current_scheduler.clone()
+            };
+
+            if tracing::level_enabled!(tracing::Level::TRACE) {
+                if let Some(ref scheduler) = current_scheduler {
+                    self.switch_logger.log_no_switch_decision(
+                        Some(scheduler),
+                        recommendation,
+                        metrics,
+                        workload_type,
+                        reason,
                     )?;
                 }
             }
@@ -408,8 +588,6 @@ impl AutoSchedulerDaemon {
 
             // Only log no-switch decisions at trace level to avoid log spam
             if tracing::level_enabled!(tracing::Level::TRACE) {
-                // Only log no-switch decisions at trace level to avoid log spam
-            if tracing::level_enabled!(tracing::Level::TRACE) {
                 self.switch_logger.log_no_switch_decision(
                     Some(&current_scheduler),
                     recommendation,
@@ -418,9 +596,11 @@ impl AutoSchedulerDaemon {
                     &reason,
                 )?;
             }
-            }
             return Ok(false);
         }
+
+        // Dynamic switch interval based on workload volatility
+        let dynamic_min_interval = self.calculate_dynamic_switch_interval(workload_type, metrics);
 
         // Check minimum switch interval
         let now = SystemTime::now()
@@ -434,9 +614,9 @@ impl AutoSchedulerDaemon {
         };
 
         if let Some(last_switch) = last_switch_time {
-            if now - last_switch < self.config.min_switch_interval_secs {
-                let reason = format!("Minimum switch interval not reached ({} < {} seconds)",
-                    now - last_switch, self.config.min_switch_interval_secs);
+            if now - last_switch < dynamic_min_interval {
+                let reason = format!("Dynamic minimum switch interval not reached ({} < {} seconds)",
+                    now - last_switch, dynamic_min_interval);
                 trace!("Not switching scheduler: {}", reason);
 
                 self.switch_logger.log_no_switch_decision(
@@ -450,11 +630,95 @@ impl AutoSchedulerDaemon {
             }
         }
 
-        Ok(true)
+        // Check if the potential performance gain justifies the switch cost
+        if self.is_switch_cost_justified(&current_scheduler, recommendation, workload_type)? {
+            Ok(true)
+        } else {
+            let reason = "Performance gain does not justify switch cost";
+            trace!("Not switching scheduler: {}", reason);
+
+            self.switch_logger.log_no_switch_decision(
+                Some(&current_scheduler),
+                recommendation,
+                metrics,
+                workload_type,
+                reason,
+            )?;
+            Ok(false)
+        }
+    }
+
+    /// Calculate dynamic switch interval based on workload characteristics and system profile
+    fn calculate_dynamic_switch_interval(&self, workload_type: &WorkloadType, metrics: &AggregatedMetrics) -> u64 {
+        let base_interval = self.config.system_profile.get_adaptive_switch_interval();
+
+        // Adjust interval based on workload type
+        let workload_multiplier = match workload_type {
+            WorkloadType::LatencySensitive => 2.0, // Longer intervals for latency-sensitive
+            WorkloadType::Transitioning => 0.5,    // Shorter for transitioning workloads
+            WorkloadType::Batch => 3.0,             // Much longer for stable batch workloads
+            _ => 1.0,
+        };
+
+        // Adjust based on volatility (CPU variance)
+        let volatility_factor = if metrics.cpu_max_percent > metrics.cpu_avg_percent {
+            let variance = metrics.cpu_max_percent - metrics.cpu_avg_percent;
+            if variance > 30.0 {
+                0.5 // High volatility - shorter intervals
+            } else if variance > 15.0 {
+                0.8 // Medium volatility
+            } else {
+                1.2 // Low volatility - longer intervals
+            }
+        } else {
+            1.0
+        };
+
+        // Adjust based on system profile
+        let profile_factor = match self.config.system_profile.profile_type {
+            ProfileType::Desktop => 1.0,
+            ProfileType::Server => 2.0,     // Slower switching for servers
+            ProfileType::Laptop => 1.5,     // Moderate for laptops
+            ProfileType::Embedded => 0.8,   // Faster for embedded systems
+            ProfileType::VirtualMachine => 0.7, // Faster for VMs
+        };
+
+        let dynamic_interval = (base_interval as f64 * workload_multiplier * volatility_factor * profile_factor) as u64;
+
+        // Clamp to reasonable bounds (5 seconds to 5 minutes)
+        dynamic_interval.clamp(5, 300)
+    }
+
+    /// Check if the performance gain justifies the cost of switching
+    fn is_switch_cost_justified(&self, current_scheduler: &str, recommendation: &SchedulerRecommendation, workload_type: &WorkloadType) -> Result<bool> {
+        // Get historical performance data
+        let current_key = format!("{}-{:?}", current_scheduler, workload_type);
+        let recommended_key = format!("{}-{:?}", recommendation.scheduler_name, workload_type);
+
+        let current_score = self.performance_feedback.performance_history
+            .get(&current_key)
+            .map(|p| p.get_overall_score())
+            .unwrap_or(0.5); // Default score if no history
+
+        let recommended_score = self.performance_feedback.performance_history
+            .get(&recommended_key)
+            .map(|p| p.get_overall_score())
+            .unwrap_or(0.5);
+
+        // Use adaptive improvement threshold based on system profile
+        let improvement_threshold = match self.config.system_profile.primary_use_case {
+            UseCase::Gaming => 0.05,      // More aggressive for gaming
+            UseCase::HighPerformanceComputing => 0.15, // More conservative for HPC
+            _ => self.config.min_performance_improvement,
+        };
+
+        let relative_improvement = (recommended_score - current_score) / f64::max(current_score, 0.1);
+
+        Ok(relative_improvement > improvement_threshold)
     }
 
     /// Switch to a new scheduler using the MCP client
-    async fn switch_scheduler(&self, recommendation: &SchedulerRecommendation, metrics: &AggregatedMetrics, workload_type: &WorkloadType) -> Result<()> {
+    async fn switch_scheduler(&mut self, recommendation: &SchedulerRecommendation, metrics: &AggregatedMetrics, workload_type: &WorkloadType) -> Result<()> {
         let start_time = SystemTime::now();
         let now = start_time
             .duration_since(UNIX_EPOCH)
@@ -480,6 +744,9 @@ impl AutoSchedulerDaemon {
             self.config.min_confidence_threshold,
             true, // We're here because min interval was met
         );
+
+        // Record the switch for performance tracking
+        self.performance_feedback.record_switch(&recommendation.scheduler_name, workload_type);
 
         // Stop the current scheduler if there is one running
         {
@@ -646,5 +913,27 @@ impl AutoSchedulerDaemon {
     /// Update configuration
     pub async fn update_config(&mut self, new_config: DaemonConfig) {
         self.config = new_config;
+    }
+
+    /// Update system profile based on current system detection
+    pub fn detect_system_profile(&mut self) {
+        self.config.system_profile = SystemProfile::default();
+
+        // Auto-detect profile type based on system characteristics
+        self.config.system_profile.profile_type = if self.config.system_profile.cpu_cores >= 16 {
+            ProfileType::Server
+        } else if self.config.system_profile.total_memory_gb < 8.0 {
+            ProfileType::Laptop
+        } else {
+            ProfileType::Desktop
+        };
+
+        // Auto-detect storage type (simplified)
+        self.config.system_profile.storage_type = StorageType::SSD; // Default assumption
+
+        // Update adaptive parameters based on detected profile
+        self.config.aggregation_window_secs = self.config.system_profile.get_adaptive_aggregation_window();
+        self.config.min_confidence_threshold = self.config.system_profile.get_adaptive_confidence_threshold();
+        self.config.min_switch_interval_secs = self.config.system_profile.get_adaptive_switch_interval();
     }
 }

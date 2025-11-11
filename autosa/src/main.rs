@@ -97,6 +97,10 @@ async fn main() -> Result<()> {
                     schedcp_cli_path: schedcp_cli_path.clone(),
                     log_file_path: log_file_path.clone(),
                     log_level: log_level.clone(),
+                    system_profile: Default::default(),
+                    enable_performance_feedback: true,
+                    stabilization_period_secs: 30,
+                    min_performance_improvement: 0.1,
                 }
             } else {
                 DaemonConfig {
@@ -108,6 +112,10 @@ async fn main() -> Result<()> {
                     schedcp_cli_path: schedcp_cli_path.clone(),
                     log_file_path: log_file_path.clone(),
                     log_level: log_level.clone(),
+                    system_profile: Default::default(),
+                    enable_performance_feedback: true,
+                    stabilization_period_secs: 30,
+                    min_performance_improvement: 0.1,
                 }
             };
 
