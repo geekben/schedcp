@@ -3,6 +3,7 @@
 //! A service that automatically monitors system workload and adjusts the Linux kernel scheduler
 //! to optimize performance based on current system conditions.
 
+pub mod ai_client;
 pub mod daemon;
 pub mod logging;
 pub mod metrics;

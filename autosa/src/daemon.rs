@@ -12,6 +12,7 @@ use crate::logging::{SwitchLogger, create_switch_event, create_failed_switch_eve
 use crate::metrics::{MetricsCollector, AggregatedMetrics};
 use crate::mcp_client::{McpClient, RunSchedulerRequest, StopSchedulerRequest};
 use crate::policy::{PolicyEngine, SchedulerRecommendation, WorkloadType, PerformanceFeedback};
+use crate::ai_client::AiClient;
 
 /// Helper function to get formatted timestamp
 fn get_timestamp() -> String {
@@ -85,6 +86,14 @@ pub struct DaemonConfig {
     pub stabilization_period_secs: u64,
     /// Minimum performance improvement threshold (0.0-1.0)
     pub min_performance_improvement: f64,
+    /// Path to Gemini CLI binary
+    pub gemini_cli_path: String,
+    /// Gemini model name to use
+    pub gemini_model_name: String,
+    /// Enable AI-based scheduler selection
+    pub enable_ai_selection: bool,
+    /// AI recommendation confidence threshold
+    pub ai_confidence_threshold: f64,
 }
 
 /// System profile for different types of systems
@@ -201,6 +210,10 @@ impl Default for DaemonConfig {
             enable_performance_feedback: true,
             stabilization_period_secs: 30,
             min_performance_improvement: 0.1,
+            gemini_cli_path: "gemini".to_string(),
+            gemini_model_name: "gemini-pro".to_string(),
+            enable_ai_selection: true,
+            ai_confidence_threshold: 0.8,
         }
     }
 }
@@ -226,12 +239,17 @@ pub struct AutoSchedulerDaemon {
     current_execution_id: Arc<Mutex<Option<String>>>,
     switch_logger: SwitchLogger,
     performance_feedback: PerformanceFeedback,
+    ai_client: AiClient,
 }
 
 impl AutoSchedulerDaemon {
     pub fn new(config: DaemonConfig) -> Result<Self> {
         let mcp_client = McpClient::new(config.schedcp_cli_path.clone());
         let switch_logger = SwitchLogger::new(config.log_file_path.clone());
+        let ai_client = AiClient::new(
+            config.gemini_cli_path.clone(),
+            config.gemini_model_name.clone(),
+        );
 
         // Initialize logging system
         switch_logger.init_logging(&config.log_level)?;
@@ -252,6 +270,7 @@ impl AutoSchedulerDaemon {
             current_execution_id: Arc::new(Mutex::new(None)),
             switch_logger,
             performance_feedback: PerformanceFeedback::new(),
+            ai_client,
         })
     }
 
@@ -401,17 +420,12 @@ impl AutoSchedulerDaemon {
             self.performance_feedback.update_metrics(&metrics);
 
             // Check if we need to rollback due to poor performance
-            let current_scheduler = {
+            let (current_scheduler, current_workload) = {
                 let state = self.state.lock().await;
-                state.current_scheduler.clone()
+                (state.current_scheduler.clone(), state.current_workload_type.clone())
             };
 
-            let current_workload = {
-                let state = self.state.lock().await;
-                state.current_workload_type.clone()
-            };
-
-            if let (Some(ref scheduler), Some(ref workload)) = (current_scheduler, current_workload) {
+            if let (Some(ref scheduler), Some(ref workload)) = (&current_scheduler, &current_workload) {
                 if self.performance_feedback.should_rollback(scheduler, workload) {
                     let timestamp = get_timestamp();
                     println!("{} Performance degradation detected, considering rollback", timestamp);
@@ -439,8 +453,39 @@ impl AutoSchedulerDaemon {
             // Classify workload (need mutable reference)
             let workload_type = self.policy_engine.classify_workload(&metrics);
 
-            // Get scheduler recommendation
-            let recommendation = self.policy_engine.recommend_scheduler(&metrics);
+            // Try AI-based recommendation first if enabled
+            let current_scheduler_ref = current_scheduler.as_deref();
+            let recommendation = if self.config.enable_ai_selection {
+                match self.get_ai_recommendation(&metrics, current_scheduler_ref, &workload_type).await {
+                    Ok(Some(ai_rec)) => {
+                        let timestamp = get_timestamp();
+                        println!("{} AI recommended scheduler: {} (confidence: {:.2}%) - {}",
+                            timestamp,
+                            ai_rec.scheduler_name,
+                            ai_rec.confidence * 100.0,
+                            ai_rec.reasoning
+                        );
+                        
+                        // Convert AI recommendation to standard format
+                        SchedulerRecommendation {
+                            scheduler_name: ai_rec.scheduler_name,
+                            confidence: ai_rec.confidence,
+                            reason: format!("AI: {}", ai_rec.reasoning),
+                            suggested_args: ai_rec.suggested_args,
+                        }
+                    }
+                    Ok(None) => {
+                        // Fallback to rule-based recommendation
+                        self.policy_engine.recommend_scheduler(&metrics)
+                    }
+                    Err(e) => {
+                        warn!("AI recommendation failed: {}, using fallback", e);
+                        self.policy_engine.recommend_scheduler(&metrics)
+                    }
+                }
+            } else {
+                self.policy_engine.recommend_scheduler(&metrics)
+            };
 
             // Check if there's a significant change to report
             let should_report = {
@@ -465,8 +510,8 @@ impl AutoSchedulerDaemon {
                 workload_changed || recommendation_changed
             };
 
-            // Only print significant changes
-            if should_report {
+            // Only print significant changes for rule-based recommendations
+            if should_report && !self.config.enable_ai_selection {
                 let timestamp = get_timestamp();
                 println!("{} Workload classified as: {:?}", timestamp, workload_type);
                 println!("{} Recommended scheduler: {} (confidence: {:.2}%) - {}",
@@ -715,6 +760,76 @@ impl AutoSchedulerDaemon {
         let relative_improvement = (recommended_score - current_score) / f64::max(current_score, 0.1);
 
         Ok(relative_improvement > improvement_threshold)
+    }
+
+    /// Get AI-based scheduler recommendation
+    async fn get_ai_recommendation(
+        &mut self,
+        metrics: &AggregatedMetrics,
+        current_scheduler: Option<&str>,
+        workload_type: &WorkloadType,
+    ) -> Result<Option<crate::ai_client::AiSchedulerRecommendation>> {
+        // Check if AI is available
+        if !self.ai_client.check_availability().await {
+            warn!("AI client not available, using rule-based recommendation");
+            return Ok(None);
+        }
+
+        // Prepare historical performance data
+        let historical_performance = self.format_historical_performance(workload_type);
+
+        // Get AI recommendation
+        let ai_recommendation = self.ai_client.recommend_scheduler(
+            metrics,
+            current_scheduler,
+            workload_type,
+            &historical_performance,
+        ).await?;
+
+        // Validate AI recommendation
+        if let Some(ref rec) = ai_recommendation {
+            // Check if confidence meets threshold
+            if rec.confidence < self.config.ai_confidence_threshold {
+                info!("AI confidence {:.2} below threshold {:.2}, ignoring recommendation",
+                    rec.confidence, self.config.ai_confidence_threshold);
+                return Ok(None);
+            }
+
+            // Validate scheduler name
+            let valid_schedulers = ["scx_bpfland", "scx_flash", "scx_lavd", "scx_rusty", "scx_simple"];
+            if !valid_schedulers.contains(&rec.scheduler_name.as_str()) {
+                warn!("AI recommended unknown scheduler: {}", rec.scheduler_name);
+                return Ok(None);
+            }
+        }
+
+        Ok(ai_recommendation)
+    }
+
+    /// Format historical performance data for AI prompt
+    fn format_historical_performance(&self, workload_type: &WorkloadType) -> String {
+        let mut performance_data = Vec::new();
+        
+        for (key, perf) in &self.performance_feedback.performance_history {
+            if perf.workload_type == *workload_type && perf.sample_count >= 3 {
+                performance_data.push(format!(
+                    "{}: Overall score={:.2}, Response time={:.1}ms, Throughput={:.1}, Latency={:.1}%, Stability={:.2}",
+                    perf.scheduler_name,
+                    perf.get_overall_score(),
+                    perf.avg_response_time,
+                    perf.avg_throughput,
+                    perf.avg_latency,
+                    perf.stability_score
+                ));
+            }
+        }
+
+        if performance_data.is_empty() {
+            "No historical performance data available".to_string()
+        } else {
+            performance_data.join("
+")
+        }
     }
 
     /// Switch to a new scheduler using the MCP client
