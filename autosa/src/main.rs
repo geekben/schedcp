@@ -53,13 +53,13 @@ enum Commands {
         #[arg(long, default_value = "warn")]
         log_level: String,
 
-        /// Path to Gemini CLI binary
-        #[arg(long, default_value = "gemini")]
-        gemini_cli_path: String,
+        /// Path to iFlow CLI binary
+        #[arg(long, default_value = "iflow")]
+        iflow_cli_path: String,
 
-        /// Gemini model name
-        #[arg(long, default_value = "gemini-pro")]
-        gemini_model: String,
+        /// iFlow model name
+        #[arg(long, default_value = "default")]
+        iflow_model: String,
 
         /// Disable AI-based scheduler selection
         #[arg(long)]
@@ -68,6 +68,22 @@ enum Commands {
         /// AI confidence threshold (0.0-1.0)
         #[arg(long, default_value = "0.8")]
         ai_confidence_threshold: f64,
+
+        /// AI call interval in seconds
+        #[arg(long, default_value = "30")]
+        ai_call_interval: u64,
+
+        /// Maximum AI calls per hour
+        #[arg(long, default_value = "60")]
+        ai_max_calls_per_hour: u32,
+
+        /// AI cache duration in seconds
+        #[arg(long, default_value = "300")]
+        ai_cache_duration: u64,
+
+        /// Minimum metric change to trigger AI (percentage)
+        #[arg(long, default_value = "0.15")]
+        ai_min_change_threshold: f64,
     },
 
     /// Stop the daemon
@@ -99,10 +115,14 @@ async fn main() -> Result<()> {
             schedcp_cli_path,
             log_file_path,
             log_level,
-            gemini_cli_path,
-            gemini_model,
+            iflow_cli_path,
+            iflow_model,
             no_ai_selection,
             ai_confidence_threshold,
+            ai_call_interval,
+            ai_max_calls_per_hour,
+            ai_cache_duration,
+            ai_min_change_threshold,
         } => {
             // Load configuration
             let config = if let Some(_config_path) = config {
@@ -121,10 +141,14 @@ async fn main() -> Result<()> {
                     enable_performance_feedback: true,
                     stabilization_period_secs: 30,
                     min_performance_improvement: 0.1,
-                    gemini_cli_path: gemini_cli_path.clone(),
-                    gemini_model_name: gemini_model.clone(),
+                    iflow_cli_path: iflow_cli_path.clone(),
+                    iflow_model_name: iflow_model.clone(),
                     enable_ai_selection: !*no_ai_selection,
                     ai_confidence_threshold: *ai_confidence_threshold,
+                    ai_call_interval_secs: *ai_call_interval,
+                    ai_max_calls_per_hour: *ai_max_calls_per_hour,
+                    ai_cache_duration_secs: *ai_cache_duration,
+                    ai_min_change_threshold: *ai_min_change_threshold,
                 }
             } else {
                 DaemonConfig {
@@ -140,10 +164,14 @@ async fn main() -> Result<()> {
                     enable_performance_feedback: true,
                     stabilization_period_secs: 30,
                     min_performance_improvement: 0.1,
-                    gemini_cli_path: gemini_cli_path.clone(),
-                    gemini_model_name: gemini_model.clone(),
+                    iflow_cli_path: iflow_cli_path.clone(),
+                    iflow_model_name: iflow_model.clone(),
                     enable_ai_selection: !*no_ai_selection,
                     ai_confidence_threshold: *ai_confidence_threshold,
+                    ai_call_interval_secs: *ai_call_interval,
+                    ai_max_calls_per_hour: *ai_max_calls_per_hour,
+                    ai_cache_duration_secs: *ai_cache_duration,
+                    ai_min_change_threshold: *ai_min_change_threshold,
                 }
             };
 

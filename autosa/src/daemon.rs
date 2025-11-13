@@ -86,14 +86,22 @@ pub struct DaemonConfig {
     pub stabilization_period_secs: u64,
     /// Minimum performance improvement threshold (0.0-1.0)
     pub min_performance_improvement: f64,
-    /// Path to Gemini CLI binary
-    pub gemini_cli_path: String,
-    /// Gemini model name to use
-    pub gemini_model_name: String,
+    /// Path to iFlow CLI binary
+    pub iflow_cli_path: String,
+    /// iFlow model name to use
+    pub iflow_model_name: String,
     /// Enable AI-based scheduler selection
     pub enable_ai_selection: bool,
     /// AI recommendation confidence threshold
     pub ai_confidence_threshold: f64,
+    /// Minimum interval between AI calls (in seconds)
+    pub ai_call_interval_secs: u64,
+    /// Maximum AI calls per hour
+    pub ai_max_calls_per_hour: u32,
+    /// AI cache duration in seconds
+    pub ai_cache_duration_secs: u64,
+    /// Minimum metric change to trigger AI call (percentage)
+    pub ai_min_change_threshold: f64,
 }
 
 /// System profile for different types of systems
@@ -210,10 +218,14 @@ impl Default for DaemonConfig {
             enable_performance_feedback: true,
             stabilization_period_secs: 30,
             min_performance_improvement: 0.1,
-            gemini_cli_path: "gemini".to_string(),
-            gemini_model_name: "gemini-pro".to_string(),
+            iflow_cli_path: "iflow".to_string(),
+            iflow_model_name: "default".to_string(),
             enable_ai_selection: true,
             ai_confidence_threshold: 0.8,
+            ai_call_interval_secs: 30, // Call AI every 30 seconds
+            ai_max_calls_per_hour: 60,  // Max 60 calls per hour (1 per minute)
+            ai_cache_duration_secs: 300, // Cache recommendations for 5 minutes
+            ai_min_change_threshold: 0.15, // 15% change needed to trigger AI
         }
     }
 }
@@ -240,6 +252,10 @@ pub struct AutoSchedulerDaemon {
     switch_logger: SwitchLogger,
     performance_feedback: PerformanceFeedback,
     ai_client: AiClient,
+    ai_last_call: Arc<Mutex<Option<u64>>>,
+    ai_call_count: Arc<Mutex<u32>>,
+    ai_cache: Arc<Mutex<Option<(String, std::time::Instant, crate::ai_client::AiSchedulerRecommendation)>>>,
+    last_metrics: Arc<Mutex<Option<AggregatedMetrics>>>,
 }
 
 impl AutoSchedulerDaemon {
@@ -247,8 +263,8 @@ impl AutoSchedulerDaemon {
         let mcp_client = McpClient::new(config.schedcp_cli_path.clone());
         let switch_logger = SwitchLogger::new(config.log_file_path.clone());
         let ai_client = AiClient::new(
-            config.gemini_cli_path.clone(),
-            config.gemini_model_name.clone(),
+            config.iflow_cli_path.clone(),
+            config.iflow_model_name.clone(),
         );
 
         // Initialize logging system
@@ -271,6 +287,10 @@ impl AutoSchedulerDaemon {
             switch_logger,
             performance_feedback: PerformanceFeedback::new(),
             ai_client,
+            ai_last_call: Arc::new(Mutex::new(None)),
+            ai_call_count: Arc::new(Mutex::new(0)),
+            ai_cache: Arc::new(Mutex::new(None)),
+            last_metrics: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -456,7 +476,7 @@ impl AutoSchedulerDaemon {
             // Try AI-based recommendation first if enabled
             let current_scheduler_ref = current_scheduler.as_deref();
             let recommendation = if self.config.enable_ai_selection {
-                match self.get_ai_recommendation(&metrics, current_scheduler_ref, &workload_type).await {
+                match self.get_ai_recommendation_cached(&metrics, current_scheduler_ref, &workload_type).await {
                     Ok(Some(ai_rec)) => {
                         let timestamp = get_timestamp();
                         println!("{} AI recommended scheduler: {} (confidence: {:.2}%) - {}",
@@ -465,7 +485,7 @@ impl AutoSchedulerDaemon {
                             ai_rec.confidence * 100.0,
                             ai_rec.reasoning
                         );
-                        
+
                         // Convert AI recommendation to standard format
                         SchedulerRecommendation {
                             scheduler_name: ai_rec.scheduler_name,
@@ -762,8 +782,8 @@ impl AutoSchedulerDaemon {
         Ok(relative_improvement > improvement_threshold)
     }
 
-    /// Get AI-based scheduler recommendation
-    async fn get_ai_recommendation(
+    /// Get AI-based scheduler recommendation with caching and rate limiting
+    async fn get_ai_recommendation_cached(
         &mut self,
         metrics: &AggregatedMetrics,
         current_scheduler: Option<&str>,
@@ -775,7 +795,38 @@ impl AutoSchedulerDaemon {
             return Ok(None);
         }
 
-        // Prepare historical performance data
+        // Check rate limits
+        if !self.check_ai_rate_limits().await {
+            return Ok(None);
+        }
+
+        // Check cache
+        let cache_key = format!("{:?}-{}-{:.1}-{:.1}-{:.1}",
+            workload_type,
+            current_scheduler.unwrap_or("none"),
+            metrics.cpu_avg_percent,
+            metrics.cpu_iowait_percent,
+            metrics.memory_avg_percent
+        );
+
+        // Check if we have a cached recommendation
+        {
+            let cache = self.ai_cache.lock().await;
+            if let Some((ref cached_key, cached_time, ref cached_rec)) = *cache {
+                if *cached_key == cache_key &&
+                   cached_time.elapsed().as_secs() < self.config.ai_cache_duration_secs {
+                    info!("Using cached AI recommendation");
+                    return Ok(Some(cached_rec.clone()));
+                }
+            }
+        }
+
+        // Check if metrics changed significantly
+        if !self.should_call_ai(metrics).await {
+            return Ok(None);
+        }
+
+        // Prepare historical performance data (limited)
         let historical_performance = self.format_historical_performance(workload_type);
 
         // Get AI recommendation
@@ -786,7 +837,7 @@ impl AutoSchedulerDaemon {
             &historical_performance,
         ).await?;
 
-        // Validate AI recommendation
+        // Validate and cache the recommendation
         if let Some(ref rec) = ai_recommendation {
             // Check if confidence meets threshold
             if rec.confidence < self.config.ai_confidence_threshold {
@@ -801,35 +852,117 @@ impl AutoSchedulerDaemon {
                 warn!("AI recommended unknown scheduler: {}", rec.scheduler_name);
                 return Ok(None);
             }
+
+            // Update cache
+            {
+                let mut cache = self.ai_cache.lock().await;
+                // Clone the AI recommendation directly since it's already the right type
+                *cache = Some((cache_key, std::time::Instant::now(), rec.clone()));
+            }
+
+            // Update rate limit tracking
+            {
+                let mut last_call = self.ai_last_call.lock().await;
+                *last_call = Some(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs());
+
+                // Increment call count
+                let mut count = self.ai_call_count.lock().await;
+                *count += 1;
+
+                info!("AI calls this hour: {}/{}", *count, self.config.ai_max_calls_per_hour);
+            }
         }
 
         Ok(ai_recommendation)
     }
 
-    /// Format historical performance data for AI prompt
-    fn format_historical_performance(&self, workload_type: &WorkloadType) -> String {
-        let mut performance_data = Vec::new();
-        
-        for (key, perf) in &self.performance_feedback.performance_history {
-            if perf.workload_type == *workload_type && perf.sample_count >= 3 {
-                performance_data.push(format!(
-                    "{}: Overall score={:.2}, Response time={:.1}ms, Throughput={:.1}, Latency={:.1}%, Stability={:.2}",
-                    perf.scheduler_name,
-                    perf.get_overall_score(),
-                    perf.avg_response_time,
-                    perf.avg_throughput,
-                    perf.avg_latency,
-                    perf.stability_score
-                ));
+    /// Check if we should call AI based on rate limits
+    async fn check_ai_rate_limits(&self) -> bool {
+        // Check minimum interval between calls
+        if let Some(last_call) = *self.ai_last_call.lock().await {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            if now - last_call < self.config.ai_call_interval_secs {
+                return false;
             }
         }
 
-        if performance_data.is_empty() {
-            "No historical performance data available".to_string()
-        } else {
-            performance_data.join("
-")
+        // Check maximum calls per hour
+        let call_count = *self.ai_call_count.lock().await;
+        if call_count >= self.config.ai_max_calls_per_hour {
+            warn!("AI hourly call limit reached ({}), using rule-based", call_count);
+            return false;
         }
+
+        true
+    }
+
+    /// Check if metrics changed enough to warrant AI call
+    async fn should_call_ai(&self, current_metrics: &AggregatedMetrics) -> bool {
+        let mut last_metrics = self.last_metrics.lock().await;
+
+        if let Some(ref prev_metrics) = *last_metrics {
+            // Calculate percentage changes
+            let cpu_change = (current_metrics.cpu_avg_percent - prev_metrics.cpu_avg_percent).abs() / prev_metrics.cpu_avg_percent.max(1.0);
+            let io_change = (current_metrics.cpu_iowait_percent - prev_metrics.cpu_iowait_percent).abs() / prev_metrics.cpu_iowait_percent.max(1.0);
+            let mem_change = (current_metrics.memory_avg_percent - prev_metrics.memory_avg_percent).abs() / prev_metrics.memory_avg_percent.max(1.0);
+
+            // If any metric changed beyond threshold, we should call AI
+            let should_call = cpu_change > self.config.ai_min_change_threshold ||
+                           io_change > self.config.ai_min_change_threshold ||
+                           mem_change > self.config.ai_min_change_threshold;
+
+            // Update last metrics
+            *last_metrics = Some(current_metrics.clone());
+
+            should_call
+        } else {
+            // First time, store metrics and call AI
+            *last_metrics = Some(current_metrics.clone());
+            true
+        }
+    }
+
+    /// Format historical performance data for AI prompt (limited)
+    fn format_historical_performance(&self, workload_type: &WorkloadType) -> String {
+        let mut performance_data = Vec::new();
+        let mut count = 0;
+
+        // Limit to top 3 performers for this workload
+        let mut performances: Vec<_> = self.performance_feedback.performance_history
+            .iter()
+            .filter(|(_, perf)| perf.workload_type == *workload_type && perf.sample_count >= 3)
+            .collect();
+
+        // Sort by overall score and take top 3
+        performances.sort_by(|a, b| b.1.get_overall_score().partial_cmp(&a.1.get_overall_score()).unwrap());
+
+        for (key, perf) in performances.iter().take(3) {
+            performance_data.push(format!(
+                "{}: {:.2}",
+                perf.scheduler_name,
+                perf.get_overall_score()
+            ));
+            count += 1;
+        }
+
+        if performance_data.is_empty() {
+            "None".to_string()
+        } else {
+            performance_data.join(", ")
+        }
+    }
+
+    /// Reset hourly call counter (call this periodically)
+    async fn reset_hourly_call_count(&self) {
+        let mut count = self.ai_call_count.lock().await;
+        *count = 0;
     }
 
     /// Switch to a new scheduler using the MCP client
