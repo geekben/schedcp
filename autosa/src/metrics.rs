@@ -288,7 +288,7 @@ impl MetricsCollector {
     }
 
     /// Calculate aggregated metrics over a time window
-    pub fn calculate_aggregated_metrics(&self, window_duration_secs: u64) -> Option<AggregatedMetrics> {
+    pub async fn calculate_aggregated_metrics(&self, window_duration_secs: u64) -> Option<AggregatedMetrics> {
         if self.samples.len() < 2 {
             return None;
         }

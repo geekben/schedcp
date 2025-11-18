@@ -445,7 +445,7 @@ impl AutoSchedulerDaemon {
         // Calculate aggregated metrics over our window
         let aggregated = self.metrics_collector.calculate_aggregated_metrics(
             self.config.aggregation_window_secs
-        );
+        ).await;
 
         if let Some(metrics) = aggregated {
             // Update performance feedback
@@ -839,7 +839,7 @@ impl AutoSchedulerDaemon {
         }
 
         // Prepare historical performance data (limited)
-        let historical_performance = self.format_historical_performance(workload_type);
+        let historical_performance = self.format_historical_performance(workload_type).await;
 
         // Get AI recommendation
         let ai_recommendation = self.ai_client.recommend_scheduler(
@@ -942,7 +942,7 @@ impl AutoSchedulerDaemon {
     }
 
     /// Format enhanced historical performance data for AI prompt
-    fn format_historical_performance(&self, workload_type: &WorkloadType) -> String {
+    async fn format_historical_performance(&self, workload_type: &WorkloadType) -> String {
         let mut performance_data = Vec::new();
 
         // Get current scheduler for trend analysis
