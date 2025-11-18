@@ -84,6 +84,22 @@ enum Commands {
         /// Minimum metric change to trigger AI (percentage)
         #[arg(long, default_value = "0.15")]
         ai_min_change_threshold: f64,
+
+        /// Performance degradation threshold for rollback (0.0-1.0)
+        #[arg(long, default_value = "0.15")]
+        performance_degradation_threshold: f64,
+
+        /// Minimum samples for performance evaluation
+        #[arg(long, default_value = "5")]
+        min_performance_samples: u32,
+
+        /// Performance trend sensitivity (0.0-1.0)
+        #[arg(long, default_value = "0.5")]
+        performance_trend_sensitivity: f64,
+
+        /// Hardware metrics weight in performance score (0.0-1.0)
+        #[arg(long, default_value = "0.4")]
+        hardware_metrics_weight: f64,
     },
 
     /// Stop the daemon
@@ -123,6 +139,10 @@ async fn main() -> Result<()> {
             ai_max_calls_per_hour,
             ai_cache_duration,
             ai_min_change_threshold,
+            performance_degradation_threshold,
+            min_performance_samples,
+            performance_trend_sensitivity,
+            hardware_metrics_weight,
         } => {
             // Load configuration
             let config = if let Some(_config_path) = config {
@@ -149,6 +169,10 @@ async fn main() -> Result<()> {
                     ai_max_calls_per_hour: *ai_max_calls_per_hour,
                     ai_cache_duration_secs: *ai_cache_duration,
                     ai_min_change_threshold: *ai_min_change_threshold,
+                    performance_degradation_threshold: *performance_degradation_threshold,
+                    min_performance_samples: *min_performance_samples,
+                    performance_trend_sensitivity: *performance_trend_sensitivity,
+                    hardware_metrics_weight: *hardware_metrics_weight,
                 }
             } else {
                 DaemonConfig {
@@ -172,6 +196,10 @@ async fn main() -> Result<()> {
                     ai_max_calls_per_hour: *ai_max_calls_per_hour,
                     ai_cache_duration_secs: *ai_cache_duration,
                     ai_min_change_threshold: *ai_min_change_threshold,
+                    performance_degradation_threshold: *performance_degradation_threshold,
+                    min_performance_samples: *min_performance_samples,
+                    performance_trend_sensitivity: *performance_trend_sensitivity,
+                    hardware_metrics_weight: *hardware_metrics_weight,
                 }
             };
 
@@ -196,10 +224,10 @@ async fn main() -> Result<()> {
 
             // Create and start daemon
             let mut daemon = AutoSchedulerDaemon::new(config)?;
-            
+
             // Detect system profile
             daemon.detect_system_profile();
-            
+
             // Start the daemon
             daemon.start().await?;
         }

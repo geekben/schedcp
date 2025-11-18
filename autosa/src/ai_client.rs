@@ -1,12 +1,11 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 use std::sync::Arc;
 use tokio::{process, sync::Mutex, time::Instant};
 use tracing::{info, warn, error, debug};
 
 use crate::metrics::AggregatedMetrics;
-use crate::policy::{WorkloadType, SchedulerRecommendation};
+use crate::policy::WorkloadType;
 
 /// AI client for intelligent scheduler selection
 pub struct AiClient {
@@ -86,9 +85,9 @@ impl AiClient {
         }
 
         let prompt = self.build_prompt(metrics, current_scheduler, workload_type, historical_performance);
-        
+
         debug!("Sending prompt to AI: {}", prompt);
-        
+
         // Track timing
         let start_time = Instant::now();
         let prompt_tokens = self.estimate_tokens(&prompt) as u64;
@@ -112,9 +111,9 @@ impl AiClient {
             usage.response_tokens += response_tokens;
             usage.total_requests += 1;
             usage.total_response_time_ms += response_time;
-            
-            info!("Token usage - Request {}: {} prompt + {} response = {} total, {}ms", 
-                usage.total_requests, prompt_tokens, response_tokens, 
+
+            info!("Token usage - Request {}: {} prompt + {} response = {} total, {}ms",
+                usage.total_requests, prompt_tokens, response_tokens,
                 usage.total_tokens, response_time);
         }
 
@@ -123,7 +122,7 @@ impl AiClient {
             error!("iFlow CLI error: {}", stderr);
             return Ok(None);
         }
-        
+
         // Try to extract JSON from the response
         let json_str = if response_str.contains('{') && response_str.contains('}') {
             // Extract JSON block if present
@@ -145,7 +144,7 @@ impl AiClient {
         // Parse the JSON response
         match serde_json::from_str::<AiSchedulerRecommendation>(json_str) {
             Ok(recommendation) => {
-                info!("AI recommended scheduler: {} with confidence: {:.2}", 
+                info!("AI recommended scheduler: {} with confidence: {:.2}",
                     recommendation.scheduler_name, recommendation.confidence);
                 Ok(Some(recommendation))
             }
@@ -174,26 +173,41 @@ impl AiClient {
         *usage = TokenUsage::default();
     }
 
-    /// Build compact prompt for AI scheduler selection
+    /// Build enhanced prompt for AI scheduler selection with performance feedback
     fn build_prompt(
         &self,
         metrics: &AggregatedMetrics,
         current_scheduler: Option<&str>,
         workload_type: &WorkloadType,
-        _historical_performance: &str,
+        historical_performance: &str,
     ) -> String {
+        let hw = &metrics.hardware_metrics;
+
         format!(
-            r#"Select best sched_ext scheduler. Current: {}, Workload: {:?}. 
-Metrics: CPU {:.1}%/{:.1}%, I/O wait {:.1}%, Mem {:.1}%/{:.1}%, I/O {:.1}/{:.1} B/s, queue {:.1}, timeslices {:.1}/s.
+            r#"Select best sched_ext scheduler. Current: {}, Workload: {:?}.
+
+SYSTEM METRICS:
+CPU: {:.1}% avg, {:.1}% max, {:.1}% iowait
+Memory: {:.1}% avg, {:.1}% max
+I/O: {:.1}/{:.1} MB/s read/write, {:.1} avg queue
+Scheduling: {:.1} timeslices/s, {:.1}μs avg latency
+
+HARDWARE METRICS:
+IPC: {:.2}, Cache: {:.1}%, Context switches: {:.0}/s
+Memory bandwidth: {:.2} GB/s, CPU freq: {:.0} MHz
+Interrupts: {:.0}/s
+
+PERFORMANCE HISTORY:
+{}
 
 SCHEDULERS:
-- bpfland: interactive/low latency
-- flash: predictable/low latency  
-- lavd: gaming/interactive
-- rusty: balanced/CPU intensive
-- simple: uniform workloads
+- bpfland: interactive/low latency, good for desktop workloads
+- flash: predictable/low latency, best for real-time applications
+- lavd: gaming/interactive, optimized for low-latency interactive tasks
+- rusty: balanced/CPU intensive, good for server and mixed workloads
+- simple: uniform workloads, minimal overhead
 
-Respond with JSON only: {{"scheduler_name": "...", "confidence": 0.95, "reasoning": "...", "suggested_args": []}}"#,
+Consider hardware metrics and performance trends. Respond with JSON only: {{"scheduler_name": "...", "confidence": 0.95, "reasoning": "...", "suggested_args": []}}"#,
             current_scheduler.unwrap_or("none"),
             workload_type,
             metrics.cpu_avg_percent,
@@ -201,10 +215,18 @@ Respond with JSON only: {{"scheduler_name": "...", "confidence": 0.95, "reasonin
             metrics.cpu_iowait_percent,
             metrics.memory_avg_percent,
             metrics.memory_max_percent,
-            metrics.io_read_bytes_per_sec,
-            metrics.io_write_bytes_per_sec,
+            metrics.io_read_bytes_per_sec / 1_000_000.0,
+            metrics.io_write_bytes_per_sec / 1_000_000.0,
             metrics.io_avg_queue_depth,
-            metrics.sched_timeslices_per_sec
+            metrics.sched_timeslices_per_sec,
+            hw.scheduling_latency_us,
+            hw.estimated_ipc,
+            hw.cache_efficiency * 100.0,
+            hw.context_switches_per_sec,
+            hw.memory_bandwidth_gb_s,
+            hw.cpu_frequency_mhz,
+            hw.interrupts_per_sec,
+            historical_performance
         )
     }
 

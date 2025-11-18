@@ -397,6 +397,25 @@ pub struct SchedulerPerformance {
     pub stability_score: f64,
     pub sample_count: u32,
     pub last_updated: u64,
+    // Enhanced hardware metrics
+    pub avg_ipc: f64,
+    pub avg_cache_efficiency: f64,
+    pub avg_context_switch_rate: f64,
+    pub avg_memory_bandwidth: f64,
+    pub avg_scheduling_latency: f64,
+    // Performance trend tracking
+    pub performance_trend: PerformanceTrend,
+    pub confidence_interval: f64,
+    pub baseline_score: f64,
+}
+
+/// Performance trend indicators
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PerformanceTrend {
+    Improving,
+    Stable,
+    Degrading,
+    Unknown,
 }
 
 impl SchedulerPerformance {
@@ -410,29 +429,112 @@ impl SchedulerPerformance {
             stability_score: 0.0,
             sample_count: 0,
             last_updated: 0,
+            avg_ipc: 0.0,
+            avg_cache_efficiency: 0.8,
+            avg_context_switch_rate: 0.0,
+            avg_memory_bandwidth: 0.0,
+            avg_scheduling_latency: 0.0,
+            performance_trend: PerformanceTrend::Unknown,
+            confidence_interval: 1.0,
+            baseline_score: 0.5,
         }
     }
 
-    pub fn update(&mut self, response_time: f64, throughput: f64, latency: f64, stability: f64) {
-        self.avg_response_time = (self.avg_response_time * self.sample_count as f64 + response_time) / (self.sample_count + 1) as f64;
-        self.avg_throughput = (self.avg_throughput * self.sample_count as f64 + throughput) / (self.sample_count + 1) as f64;
-        self.avg_latency = (self.avg_latency * self.sample_count as f64 + latency) / (self.sample_count + 1) as f64;
-        self.stability_score = (self.stability_score * self.sample_count as f64 + stability) / (self.sample_count + 1) as f64;
+    pub fn update(&mut self, response_time: f64, throughput: f64, latency: f64, stability: f64,
+                   ipc: f64, cache_efficiency: f64, context_switch_rate: f64,
+                   memory_bandwidth: f64, scheduling_latency: f64) {
+        let n = self.sample_count as f64;
+        let new_n = n + 1.0;
+
+        // Update running averages
+        self.avg_response_time = (self.avg_response_time * n + response_time) / new_n;
+        self.avg_throughput = (self.avg_throughput * n + throughput) / new_n;
+        self.avg_latency = (self.avg_latency * n + latency) / new_n;
+        self.stability_score = (self.stability_score * n + stability) / new_n;
+        self.avg_ipc = (self.avg_ipc * n + ipc) / new_n;
+        self.avg_cache_efficiency = (self.avg_cache_efficiency * n + cache_efficiency) / new_n;
+        self.avg_context_switch_rate = (self.avg_context_switch_rate * n + context_switch_rate) / new_n;
+        self.avg_memory_bandwidth = (self.avg_memory_bandwidth * n + memory_bandwidth) / new_n;
+        self.avg_scheduling_latency = (self.avg_scheduling_latency * n + scheduling_latency) / new_n;
+
         self.sample_count += 1;
         self.last_updated = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        // Update confidence interval based on sample count
+        self.confidence_interval = 1.0 / (1.0 + (self.sample_count as f64 * 0.1));
+
+        // Set baseline after first few samples
+        if self.sample_count == 3 {
+            self.baseline_score = self.get_overall_score();
+        }
     }
 
     pub fn get_overall_score(&self) -> f64 {
-        // Weighted score: 40% throughput, 30% latency, 20% stability, 10% response time
+        // Enhanced weighted score with hardware metrics
         let throughput_score = (self.avg_throughput / 1000.0).min(1.0);
         let latency_score = 1.0 - (self.avg_latency / 100.0).min(1.0);
         let stability_score = self.stability_score;
         let response_score = 1.0 - (self.avg_response_time / 50.0).min(1.0);
 
-        throughput_score * 0.4 + latency_score * 0.3 + stability_score * 0.2 + response_score * 0.1
+        // Hardware-based scores
+        let ipc_score = (self.avg_ipc / 2.0).min(1.0); // Normalize IPC (assuming 2.0 is good)
+        let cache_score = self.avg_cache_efficiency;
+        let context_switch_score = 1.0 - (self.avg_context_switch_rate / 10000.0).min(1.0);
+        let memory_bw_score = (self.avg_memory_bandwidth / 10.0).min(1.0); // Normalize to 10GB/s
+        let scheduling_latency_score = 1.0 - (self.avg_scheduling_latency / 100.0).min(1.0);
+
+        // Weighted combination
+        throughput_score * 0.25 +
+        latency_score * 0.20 +
+        stability_score * 0.15 +
+        response_score * 0.10 +
+        ipc_score * 0.10 +
+        cache_score * 0.10 +
+        context_switch_score * 0.05 +
+        memory_bw_score * 0.03 +
+        scheduling_latency_score * 0.02
+    }
+
+    /// Check if performance is statistically significant compared to baseline
+    pub fn is_significant_improvement(&self) -> bool {
+        if self.sample_count < 5 {
+            return false;
+        }
+
+        let current_score = self.get_overall_score();
+        let improvement = (current_score - self.baseline_score) / self.baseline_score;
+        let significance_threshold = 0.05 * self.confidence_interval;
+
+        improvement > significance_threshold
+    }
+
+    /// Update performance trend based on recent samples
+    pub fn update_trend(&mut self, recent_scores: &[f64]) {
+        if recent_scores.len() < 3 {
+            self.performance_trend = PerformanceTrend::Unknown;
+            return;
+        }
+
+        // Simple linear regression to determine trend
+        let n = recent_scores.len() as f64;
+        let sum_x: f64 = (0..recent_scores.len()).map(|i| i as f64).sum();
+        let sum_y: f64 = recent_scores.iter().sum();
+        let sum_xy: f64 = recent_scores.iter().enumerate()
+            .map(|(i, &y)| i as f64 * y).sum();
+        let sum_x2: f64 = (0..recent_scores.len()).map(|i| (i as f64).powi(2)).sum();
+
+        let slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x.powi(2));
+
+        self.performance_trend = if slope > 0.01 {
+            PerformanceTrend::Improving
+        } else if slope < -0.01 {
+            PerformanceTrend::Degrading
+        } else {
+            PerformanceTrend::Stable
+        };
     }
 }
 
@@ -442,6 +544,11 @@ pub struct PerformanceFeedback {
     current_metrics: Option<AggregatedMetrics>,
     switch_timestamp: Option<u64>,
     stabilization_period_secs: u64,
+    previous_scheduler: Option<String>,
+    pre_switch_metrics: Option<AggregatedMetrics>,
+    performance_samples: Vec<f64>,
+    min_samples_for_evaluation: u32,
+    current_workload_type: Option<WorkloadType>,
 }
 
 impl PerformanceFeedback {
@@ -451,16 +558,29 @@ impl PerformanceFeedback {
             current_metrics: None,
             switch_timestamp: None,
             stabilization_period_secs: 30, // 30 seconds stabilization period
+            previous_scheduler: None,
+            pre_switch_metrics: None,
+            performance_samples: Vec::with_capacity(100),
+            min_samples_for_evaluation: 5,
+            current_workload_type: None,
         }
     }
 
     pub fn record_switch(&mut self, scheduler_name: &str, workload_type: &WorkloadType) {
+        // Store pre-switch metrics for comparison
+        self.pre_switch_metrics = self.current_metrics.clone();
+        self.previous_scheduler = Some(scheduler_name.to_string());
+        self.current_workload_type = Some(workload_type.clone());
+
         self.switch_timestamp = Some(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs()
         );
+
+        // Clear performance samples for new evaluation
+        self.performance_samples.clear();
 
         let key = format!("{}-{:?}", scheduler_name, workload_type);
         if !self.performance_history.contains_key(&key) {
@@ -473,6 +593,15 @@ impl PerformanceFeedback {
 
     pub fn update_metrics(&mut self, metrics: &AggregatedMetrics) {
         self.current_metrics = Some(metrics.clone());
+
+        // Track performance samples
+        let score = self.calculate_performance_score(metrics);
+        self.performance_samples.push(score);
+
+        // Keep only recent samples
+        if self.performance_samples.len() > 100 {
+            self.performance_samples.drain(0..(self.performance_samples.len() - 100));
+        }
 
         // If we're in stabilization period after a switch, update performance
         if let Some(switch_time) = self.switch_timestamp {
@@ -488,40 +617,133 @@ impl PerformanceFeedback {
         }
     }
 
+    /// Calculate a performance score from current metrics
+    fn calculate_performance_score(&self, metrics: &AggregatedMetrics) -> f64 {
+        let hw = &metrics.hardware_metrics;
+
+        // Combine multiple metrics into a single score
+        let cpu_score = 1.0 - (metrics.cpu_avg_percent / 100.0);
+        let io_score = 1.0 - (metrics.cpu_iowait_percent / 20.0).min(1.0);
+        let mem_score = 1.0 - (metrics.memory_avg_percent / 100.0);
+        let ipc_score = (hw.estimated_ipc / 2.0).min(1.0);
+        let cache_score = hw.cache_efficiency;
+        let latency_score = 1.0 - (hw.scheduling_latency_us / 1000.0).min(1.0);
+
+        (cpu_score * 0.3 + io_score * 0.2 + mem_score * 0.2 +
+         ipc_score * 0.15 + cache_score * 0.1 + latency_score * 0.05)
+    }
+
     fn evaluate_performance(&mut self) {
+        if self.performance_samples.len() < self.min_samples_for_evaluation as usize {
+            return;
+        }
+
+        let workload_type = self.current_workload_type.as_ref().unwrap();
+
         if let Some(ref metrics) = self.current_metrics {
-            // Calculate performance metrics
+            let hw = &metrics.hardware_metrics;
+
+            // Calculate enhanced performance metrics
             let response_time = metrics.sched_avg_run_time_ns as f64 / 1_000_000.0; // Convert to ms
             let throughput = metrics.sched_timeslices_per_sec;
             let latency = metrics.cpu_iowait_percent;
             let stability = 1.0 - (metrics.cpu_max_percent - metrics.cpu_avg_percent) / 100.0;
 
-            // Update all relevant scheduler performance records
-            for (_, perf) in self.performance_history.iter_mut() {
-                if perf.sample_count > 0 { // Only update existing records
-                    perf.update(response_time, throughput, latency, stability);
+            // Hardware metrics
+            let ipc = hw.estimated_ipc;
+            let cache_efficiency = hw.cache_efficiency;
+            let context_switch_rate = hw.context_switches_per_sec;
+            let memory_bandwidth = hw.memory_bandwidth_gb_s;
+            let scheduling_latency = hw.scheduling_latency_us;
+
+            // Update performance records for current scheduler
+            if let Some(ref scheduler) = self.previous_scheduler {
+                let key = format!("{}-{:?}", scheduler, workload_type);
+                if let Some(perf) = self.performance_history.get_mut(&key) {
+                    perf.update(response_time, throughput, latency, stability,
+                               ipc, cache_efficiency, context_switch_rate,
+                               memory_bandwidth, scheduling_latency);
+
+                    // Update trend based on recent samples
+                    perf.update_trend(&self.performance_samples);
                 }
             }
+        }
+    }
+
+    /// Compare pre and post switch performance
+    pub fn get_switch_effectiveness(&self) -> Option<f64> {
+        if let (Some(pre), Some(post)) = (&self.pre_switch_metrics, &self.current_metrics) {
+            let pre_score = self.calculate_performance_score(pre);
+            let post_score = self.calculate_performance_score(post);
+
+            Some((post_score - pre_score) / pre_score.max(0.1))
+        } else {
+            None
+        }
+    }
+
+    /// Check if the current scheduler is performing significantly worse
+    pub fn is_performance_degrading(&self) -> bool {
+        if self.performance_samples.len() < 10 {
+            return false;
+        }
+
+        // Check recent trend
+        let recent_samples: Vec<f64> = self.performance_samples
+            .iter()
+            .rev()
+            .take(10)
+            .copied()
+            .collect();
+
+        // Simple check: if average of last 5 samples is worse than previous 5
+        if recent_samples.len() >= 10 {
+            let recent_avg: f64 = recent_samples[0..5].iter().sum::<f64>() / 5.0;
+            let previous_avg: f64 = recent_samples[5..10].iter().sum::<f64>() / 5.0;
+
+            // If performance degraded by more than 10%
+            (previous_avg - recent_avg) / previous_avg > 0.1
+        } else {
+            false
         }
     }
 
     pub fn should_rollback(&self, current_scheduler: &str, workload_type: &WorkloadType) -> bool {
         let key = format!("{}-{:?}", current_scheduler, workload_type);
 
+        // Check if we have enough samples
         if let Some(perf) = self.performance_history.get(&key) {
-            if perf.sample_count < 3 {
-                return false; // Not enough data
+            if perf.sample_count < self.min_samples_for_evaluation {
+                return false;
             }
 
             // Check if performance is significantly worse than baseline
-            let baseline_score = self.get_baseline_score(workload_type);
             let current_score = perf.get_overall_score();
+            if perf.baseline_score > 0.0 {
+                let degradation = (perf.baseline_score - current_score) / perf.baseline_score;
 
-            // Rollback if performance is 20% worse than baseline
-            current_score < baseline_score * 0.8
-        } else {
-            false
+                // Rollback if performance is 15% worse than baseline
+                if degradation > 0.15 {
+                    return true;
+                }
+            }
+
+            // Check if trend is degrading
+            if matches!(perf.performance_trend, PerformanceTrend::Degrading) {
+                // Only rollback if confidence is high enough
+                if perf.confidence_interval < 0.5 {
+                    return true;
+                }
+            }
+
+            // Check recent performance degradation
+            if self.is_performance_degrading() {
+                return true;
+            }
         }
+
+        false
     }
 
     fn get_baseline_score(&self, workload_type: &WorkloadType) -> f64 {

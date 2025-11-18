@@ -102,6 +102,14 @@ pub struct DaemonConfig {
     pub ai_cache_duration_secs: u64,
     /// Minimum metric change to trigger AI call (percentage)
     pub ai_min_change_threshold: f64,
+    /// Performance degradation threshold for rollback (0.0-1.0)
+    pub performance_degradation_threshold: f64,
+    /// Minimum samples for performance evaluation
+    pub min_performance_samples: u32,
+    /// Performance trend sensitivity (0.0-1.0)
+    pub performance_trend_sensitivity: f64,
+    /// Hardware metrics weight in performance score (0.0-1.0)
+    pub hardware_metrics_weight: f64,
 }
 
 /// System profile for different types of systems
@@ -226,6 +234,10 @@ impl Default for DaemonConfig {
             ai_max_calls_per_hour: 60,  // Max 60 calls per hour (1 per minute)
             ai_cache_duration_secs: 300, // Cache recommendations for 5 minutes
             ai_min_change_threshold: 0.15, // 15% change needed to trigger AI
+            performance_degradation_threshold: 0.15, // 15% degradation triggers rollback
+            min_performance_samples: 5, // Minimum samples for evaluation
+            performance_trend_sensitivity: 0.5, // Medium sensitivity to trends
+            hardware_metrics_weight: 0.4, // 40% weight for hardware metrics in score
         }
     }
 }
@@ -929,33 +941,65 @@ impl AutoSchedulerDaemon {
         }
     }
 
-    /// Format historical performance data for AI prompt (limited)
+    /// Format enhanced historical performance data for AI prompt
     fn format_historical_performance(&self, workload_type: &WorkloadType) -> String {
         let mut performance_data = Vec::new();
-        let mut count = 0;
 
-        // Limit to top 3 performers for this workload
+        // Get current scheduler for trend analysis
+        let current_scheduler = {
+            let state = self.state.lock().await;
+            state.current_scheduler.clone()
+        };
+
+        // Limit to top 5 performers for this workload
         let mut performances: Vec<_> = self.performance_feedback.performance_history
             .iter()
             .filter(|(_, perf)| perf.workload_type == *workload_type && perf.sample_count >= 3)
             .collect();
 
-        // Sort by overall score and take top 3
+        // Sort by overall score and take top 5
         performances.sort_by(|a, b| b.1.get_overall_score().partial_cmp(&a.1.get_overall_score()).unwrap());
 
-        for (key, perf) in performances.iter().take(3) {
+        // Format each performance entry with enhanced details
+        for (key, perf) in performances.iter().take(5) {
+            let trend_indicator = match perf.performance_trend {
+                crate::policy::PerformanceTrend::Improving => "↑",
+                crate::policy::PerformanceTrend::Degrading => "↓",
+                crate::policy::PerformanceTrend::Stable => "→",
+                crate::policy::PerformanceTrend::Unknown => "?",
+            };
+
+            let current_marker = if Some(&perf.scheduler_name) == current_scheduler.as_ref() {
+                " [CURRENT]"
+            } else {
+                ""
+            };
+
             performance_data.push(format!(
-                "{}: {:.2}",
+                "{}{}: {:.2} (IPC: {:.2}, Cache: {:.1}%, samples: {}) {}",
                 perf.scheduler_name,
-                perf.get_overall_score()
+                current_marker,
+                perf.get_overall_score(),
+                perf.avg_ipc,
+                perf.avg_cache_efficiency * 100.0,
+                perf.sample_count,
+                trend_indicator
             ));
-            count += 1;
+        }
+
+        // Add switch effectiveness if available
+        if let Some(effectiveness) = self.performance_feedback.get_switch_effectiveness() {
+            if effectiveness > 0.0 {
+                performance_data.push(format!("Last switch effectiveness: +{:.1}%", effectiveness * 100.0));
+            } else {
+                performance_data.push(format!("Last switch effectiveness: {:.1}%", effectiveness * 100.0));
+            }
         }
 
         if performance_data.is_empty() {
-            "None".to_string()
+            "No historical data available".to_string()
         } else {
-            performance_data.join(", ")
+            performance_data.join("\n")
         }
     }
 
