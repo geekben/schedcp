@@ -141,20 +141,39 @@ impl AiClient {
             return Ok(None);
         };
 
-        // Parse the JSON response
-        match serde_json::from_str::<AiSchedulerRecommendation>(json_str) {
-            Ok(recommendation) => {
-                info!("AI recommended scheduler: {} with confidence: {:.2}",
-                    recommendation.scheduler_name, recommendation.confidence);
-                Ok(Some(recommendation))
+        // Parse the JSON response - first try with scheduler_name field
+        let recommendation = if let Ok(rec) = serde_json::from_str::<AiSchedulerRecommendation>(json_str) {
+            rec
+        } else {
+            // Try parsing with 'scheduler' field instead of 'scheduler_name'
+            #[derive(Deserialize)]
+            struct AltAiSchedulerRecommendation {
+                scheduler: String,
+                confidence: f64,
+                reasoning: String,
+                suggested_args: Vec<String>,
+                expected_benefit: Option<String>,
             }
-            Err(e) => {
-                error!("Failed to parse AI response: {}", e);
+
+            if let Ok(alt_rec) = serde_json::from_str::<AltAiSchedulerRecommendation>(json_str) {
+                AiSchedulerRecommendation {
+                    scheduler_name: alt_rec.scheduler,
+                    confidence: alt_rec.confidence,
+                    reasoning: alt_rec.reasoning,
+                    suggested_args: alt_rec.suggested_args,
+                    expected_benefit: alt_rec.expected_benefit,
+                }
+            } else {
+                error!("Failed to parse AI response with both field name variants");
                 error!("Extracted JSON: {}", json_str);
                 error!("Raw response: {}", response_str);
-                Ok(None)
+                return Ok(None);
             }
-        }
+        };
+
+        info!("AI recommended scheduler: {} with confidence: {:.2}",
+            recommendation.scheduler_name, recommendation.confidence);
+        Ok(Some(recommendation))
     }
 
     /// Estimate token count (rough approximation: 1 token ≈ 4 characters)
@@ -208,7 +227,15 @@ SCHEDULERS:
 - simple: uniform workloads, minimal overhead
 - disable: use system default scheduler (disable sched_ext), optimal for very low load systems
 
-Consider hardware metrics and performance trends. Respond with JSON only: {{"scheduler_name": "...", "confidence": 0.95, "reasoning": "...", "suggested_args": []}}"#,
+Consider hardware metrics and performance trends.
+
+IMPORTANT: Respond with valid JSON only. The JSON MUST have these exact field names:
+- scheduler_name (not "scheduler")
+- confidence (number between 0 and 1)
+- reasoning (string)
+- suggested_args (array of strings)
+
+Example: {{"scheduler_name": "rusty", "confidence": 0.95, "reasoning": "Balanced workload detected", "suggested_args": []}}"#,
             current_scheduler.unwrap_or("none"),
             workload_type,
             metrics.cpu_avg_percent,
