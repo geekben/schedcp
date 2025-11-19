@@ -252,6 +252,7 @@ async fn main() -> Result<()> {
             println!("  scx_lavd - Low latency and interactivity");
             println!("  scx_rusty - Balanced general-purpose performance");
             println!("  scx_simple - Simple and predictable performance");
+            println!("  disable - Use system default scheduler (disable sched_ext)");
         }
     }
 

@@ -241,6 +241,21 @@ impl PolicyEngine {
     pub fn recommend_scheduler(&mut self, metrics: &super::metrics::AggregatedMetrics) -> SchedulerRecommendation {
         let workload_type = self.classify_workload(metrics);
 
+        // Check if system should use default scheduler (disable sched_ext)
+        // Conditions: very low load and stable workload
+        if metrics.cpu_avg_percent < 10.0
+            && metrics.cpu_iowait_percent < 1.0
+            && metrics.memory_avg_percent < 50.0
+            && self.is_workload_stable() {
+
+            return SchedulerRecommendation {
+                scheduler_name: "disable".to_string(),
+                confidence: 0.85,
+                reason: "System under very low load and stable, default scheduler is optimal".to_string(),
+                suggested_args: vec![],
+            };
+        }
+
         // Match workload type to appropriate scheduler
         let (scheduler_name, reason) = match workload_type {
             WorkloadType::CpuBound => {

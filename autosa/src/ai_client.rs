@@ -206,6 +206,7 @@ SCHEDULERS:
 - lavd: gaming/interactive, optimized for low-latency interactive tasks
 - rusty: balanced/CPU intensive, good for server and mixed workloads
 - simple: uniform workloads, minimal overhead
+- disable: use system default scheduler (disable sched_ext), optimal for very low load systems
 
 Consider hardware metrics and performance trends. Respond with JSON only: {{"scheduler_name": "...", "confidence": 0.95, "reasoning": "...", "suggested_args": []}}"#,
             current_scheduler.unwrap_or("none"),

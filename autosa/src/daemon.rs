@@ -859,7 +859,7 @@ impl AutoSchedulerDaemon {
             }
 
             // Validate scheduler name
-            let valid_schedulers = ["scx_bpfland", "scx_flash", "scx_lavd", "scx_rusty", "scx_simple"];
+            let valid_schedulers = ["scx_bpfland", "scx_flash", "scx_lavd", "scx_rusty", "scx_simple", "disable"];
             if !valid_schedulers.contains(&rec.scheduler_name.as_str()) {
                 warn!("AI recommended unknown scheduler: {}", rec.scheduler_name);
                 return Ok(None);
@@ -1063,6 +1063,47 @@ impl AutoSchedulerDaemon {
 
         // Clean up any temporary directories left by the previous scheduler
         cleanup_schedcp_temp_directories().await?;
+
+        // Check if the recommendation is to disable sched_ext
+        if recommendation.scheduler_name == "disable" {
+            info!("Disabling sched_ext, reverting to system default scheduler");
+
+            let switch_duration = start_time.elapsed()
+                .context("Failed to calculate switch duration")?
+                .as_millis() as u64;
+
+            // Update our state
+            {
+                let mut state = self.state.lock().await;
+                state.current_scheduler = None;
+                state.last_switch_timestamp = Some(now);
+            }
+
+            // Clear the execution ID
+            {
+                let mut execution_id = self.current_execution_id.lock().await;
+                *execution_id = None;
+            }
+
+            info!("Scheduler disabled at {}", now);
+
+            // Log the successful disable
+            let switch_event = create_switch_event(
+                previous_scheduler,
+                recommendation,
+                metrics,
+                &workload_type,
+                decision_factors,
+                None, // No execution ID when disabling
+                Some(switch_duration),
+            );
+
+            if let Err(e) = self.switch_logger.log_switch_event(&switch_event) {
+                warn!("Failed to log scheduler disable event: {}", e);
+            }
+
+            return Ok(()); // Successfully disabled
+        }
 
         // Start the new scheduler
         let run_request = RunSchedulerRequest {
